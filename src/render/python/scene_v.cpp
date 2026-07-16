@@ -70,6 +70,44 @@ MI_PY_EXPORT(Scene) {
         .def("ray_test",
              nb::overload_cast<const Ray3f &, Mask, Mask>(&Scene::ray_test, nb::const_),
              "ray"_a, "coherent"_a, "active"_a = true, D(Scene, ray_test, 2))
+        .def("ray_transmittance_ellipsoids",
+             &Scene::ray_transmittance_ellipsoids,
+             "ray"_a, "seed"_a, "mode_flags"_a, "active"_a = true,
+             "Any-hit-driven ellipsoid transmittance query (CUDA/OptiX only). "
+             "``mode_flags`` selects ``RayFlags.TransmittanceEllipsoids`` "
+             "(returns the deterministic signed optical depth sum tau, "
+             "order-independent; +inf on a blocking non-ellipsoid hit) or "
+             "``RayFlags.StochasticEllipsoids`` (per-primitive Bernoulli "
+             "tests seeded by ``seed``; unbiased binary transmittance sample "
+             "in {0, 1}). Primitives containing the ray origin are not "
+             "visited.")
+        .def("ray_sample_ellipsoids",
+             &Scene::ray_sample_ellipsoids,
+             "ray"_a, "seed"_a, "t_start"_a, "active"_a = true,
+             "Any-hit-driven ellipsoid free-flight distance sampling "
+             "(CUDA/OptiX only): every intersected primitive draws its "
+             "closed-form inverse-CDF free flight over the kernel's full "
+             "support (Gaussian kernel / Gaussian envelope for Gabors) "
+             "with a stateless per-primitive RNG and the minimum wins, "
+             "composing the exact mixture free flight in one traversal. "
+             "Flights are conditioned on survival past ``t_start`` (0 for "
+             "a fresh sample). Returns ``(t, shape_registry_id, "
+             "prim_index, pi)`` where ``pi`` is the closest blocking "
+             "non-ellipsoid surface (clips the query). Primitives "
+             "containing the ray origin are visited via interior-hit "
+             "reporting.")
+        .def("ray_collect_ellipsoids",
+             &Scene::ray_collect_ellipsoids,
+             "ray"_a, "slot_addr"_a, "capacity"_a, "active"_a = true,
+             "Any-hit-driven collection of the ellipsoid primitives whose "
+             "extent shells contain the ray origin (CUDA/OptiX only). "
+             "Writes up to ``capacity`` (shape_registry_id, prim_index) "
+             "pairs at the per-lane device address ``slot_addr`` "
+             "(``mi.device_address(buffer) + slot * 2 * capacity * 4``, "
+             "resolved outside symbolic regions on an *evaluated* buffer) "
+             "and returns the count. Fold ``count & 0`` into gather "
+             "indices so reads order after the traversal; bound "
+             "``ray.maxt`` by twice the largest primitive radius.")
 #if !defined(MI_ENABLE_EMBREE)
         .def("ray_intersect_naive",
             &Scene::ray_intersect_naive,
@@ -161,6 +199,19 @@ MI_PY_EXPORT(Scene) {
         .def("__repr__", &Scene::to_string);
 
     dr::bind_traverse(scene);
+
+    m.def("device_address",
+          [](const UInt32 &array) -> uintptr_t {
+              if constexpr (dr::is_jit_v<UInt32>)
+                  return (uintptr_t) array.data();
+              else
+                  return (uintptr_t) &array;
+          },
+          "array"_a,
+          "Device address of an *evaluated* JIT array. Used to hand "
+          "caller-allocated buffers to the any-hit collect queries; must "
+          "be resolved outside symbolic regions (evaluates the array if "
+          "needed).");
 
     // Type-specific registration functions
     m.def("register_integrator",

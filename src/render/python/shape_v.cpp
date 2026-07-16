@@ -95,6 +95,15 @@ template <typename Ptr, typename Cls> void bind_shape_generic(Cls &cls) {
        .def("shape_type",
             [](Ptr shape) { return shape->shape_type(); },
             D(Shape, shape_type))
+       .def("kernel_type",
+            [](Ptr shape) { return shape->kernel_type(); },
+            D(Shape, kernel_type))
+       .def("is_gabor",
+            [](Ptr shape) { return shape->is_gabor(); },
+            D(Shape, is_gabor))
+       .def("visibility_mask",
+            [](Ptr shape) { return shape->visibility_mask(); },
+            D(Shape, visibility_mask))
        .def("interior_medium",
             [](Ptr shape) -> RetMedium { return shape->interior_medium(); },
             D(Shape, interior_medium))
@@ -333,6 +342,9 @@ MI_PY_EXPORT(Shape) {
             &Shape::texture_attribute), D(Shape, texture_attribute), "name"_a)
         .def_method(Shape, remove_attribute, "name"_a)
         .def_method(Shape, is_mesh)
+        .def_method(Shape, kernel_type)
+        .def_method(Shape, is_gabor)
+        .def_method(Shape, visibility_mask)
         .def_method(Shape, parameters_grad_enabled)
         .def_method(Shape, set_bsdf, "bsdf"_a)
         .def_method(Shape, primitive_count)

@@ -237,6 +237,62 @@ Scene<Float, Spectrum>::ray_test(const Ray3f &ray, Mask coherent, Mask active) c
     return m_accel.ray_test(this, ray, coherent, active);
 }
 
+MI_VARIANT Float
+Scene<Float, Spectrum>::ray_transmittance_ellipsoids(const Ray3f &ray,
+                                                     const UInt32 &seed,
+                                                     uint32_t mode_flags,
+                                                     Mask active) const {
+    MI_MASKED_FUNCTION(ProfilerPhase::RayTest, active);
+    if constexpr (dr::is_cuda_v<Float>) {
+        return m_accel.ray_transmittance_ellipsoids(this, ray, seed,
+                                                    mode_flags, active);
+    } else {
+        DRJIT_MARK_USED(ray);
+        DRJIT_MARK_USED(seed);
+        DRJIT_MARK_USED(mode_flags);
+        DRJIT_MARK_USED(active);
+        NotImplementedError("ray_transmittance_ellipsoids (CUDA/OptiX only)");
+    }
+}
+
+MI_VARIANT std::tuple<Float, typename Scene<Float, Spectrum>::UInt32,
+                      typename Scene<Float, Spectrum>::UInt32,
+                      typename Scene<Float, Spectrum>::PreliminaryIntersection3f>
+Scene<Float, Spectrum>::ray_sample_ellipsoids(const Ray3f &ray,
+                                              const UInt32 &seed,
+                                              const Float &t_start,
+                                              Mask active) const {
+    MI_MASKED_FUNCTION(ProfilerPhase::RayIntersect, active);
+    if constexpr (dr::is_cuda_v<Float>) {
+        return m_accel.ray_sample_ellipsoids(this, ray, seed, t_start,
+                                             active);
+    } else {
+        DRJIT_MARK_USED(ray);
+        DRJIT_MARK_USED(seed);
+        DRJIT_MARK_USED(t_start);
+        DRJIT_MARK_USED(active);
+        NotImplementedError("ray_sample_ellipsoids (CUDA/OptiX only)");
+    }
+}
+
+MI_VARIANT typename Scene<Float, Spectrum>::UInt32
+Scene<Float, Spectrum>::ray_collect_ellipsoids(const Ray3f &ray,
+                                               const UInt64 &slot_addr,
+                                               uint32_t capacity,
+                                               Mask active) const {
+    MI_MASKED_FUNCTION(ProfilerPhase::RayTest, active);
+    if constexpr (dr::is_cuda_v<Float>) {
+        return m_accel.ray_collect_ellipsoids(this, ray, slot_addr,
+                                              capacity, active);
+    } else {
+        DRJIT_MARK_USED(ray);
+        DRJIT_MARK_USED(slot_addr);
+        DRJIT_MARK_USED(capacity);
+        DRJIT_MARK_USED(active);
+        NotImplementedError("ray_collect_ellipsoids (CUDA/OptiX only)");
+    }
+}
+
 MI_VARIANT typename Scene<Float, Spectrum>::SurfaceInteraction3f
 Scene<Float, Spectrum>::ray_intersect_naive(const Ray3f &ray, Mask active) const {
     MI_MASKED_FUNCTION(ProfilerPhase::RayIntersect, active);

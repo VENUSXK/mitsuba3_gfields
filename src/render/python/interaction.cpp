@@ -12,6 +12,12 @@ MI_PY_EXPORT(RayFlags) {
         .def_value(RayFlags, ShadingFrame)
         .def_value(RayFlags, FollowShape)
         .def_value(RayFlags, DetachShape)
+        // Volumetric-primitive any-hit flags (no auto-generated docstrings)
+        .value("NoInvoke", RayFlags::NoInvoke)
+        .value("StochasticEllipsoids", RayFlags::StochasticEllipsoids)
+        .value("TransmittanceEllipsoids", RayFlags::TransmittanceEllipsoids)
+        .value("SampleEllipsoids", RayFlags::SampleEllipsoids)
+        .value("CollectEllipsoids", RayFlags::CollectEllipsoids)
         .def_value(RayFlags, All)
         .def_value(RayFlags, AllNonDifferentiable);
 }

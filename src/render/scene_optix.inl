@@ -120,7 +120,11 @@ const MiOptixConfig &init_optix_config(uint32_t shape_types, bool compact) {
     }
 
     config.pipeline_compile_options.usesMotionBlur     = false;
-    config.pipeline_compile_options.numPayloadValues   = 0;
+    // Six payload registers for the any-hit volumetric-primitive queries
+    // (mi ray flags + per-mode payloads: transmittance uses 3, distance
+    // sampling 6, coverage collection 5 -- see optix_rt.cu); regular traces
+    // pass no payloads and disable any-hit execution.
+    config.pipeline_compile_options.numPayloadValues   = 6;
     config.pipeline_compile_options.numAttributeValues = 2; // the minimum legal value
     config.pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
     config.pipeline_compile_options.traversableGraphFlags =
@@ -258,9 +262,23 @@ const MiOptixConfig &init_optix_config(uint32_t shape_types, bool compact) {
     memset(pgd, 0, sizeof(pgd)); // Use memset due to union member.
     uint32_t pg_count = 0;
 
-    // First hitgroup is for triangle meshes. We always create it, as
-    // empty pipelines cause linker errors.
+    // The transmittance any-hit program only exists when ellipsoid shapes are
+    // present (mesh-only pipelines never compile the main module, and the
+    // query is meaningless without ellipsoids).
+    bool have_ellipsoid_shapes =
+        (shape_types & (uint32_t) ShapeType::Ellipsoids) != 0 ||
+        (shape_types & ((uint32_t) ShapeType::EllipsoidsMesh &
+                        ~(uint32_t) ShapeType::Mesh)) != 0;
+
+    // First hitgroup is for triangle meshes (EllipsoidsMesh included via its
+    // Mesh bit). We always create it, as empty pipelines cause linker errors.
+    // The any-hit program serves the ellipsoid transmittance queries and is
+    // disabled per-ray everywhere else.
     pgd[pg_count].kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    if (have_ellipsoid_shapes) {
+        pgd[pg_count].hitgroup.moduleAH            = config.main_module;
+        pgd[pg_count].hitgroup.entryFunctionNameAH = "__anyhit__transmittance";
+    }
     config.pg_mapping[ShapeType::Mesh] = pg_count++;
 
     if (shape_types & (uint32_t) ShapeType::BSplineCurve) {
@@ -307,6 +325,8 @@ const MiOptixConfig &init_optix_config(uint32_t shape_types, bool compact) {
         pgd[pg_count].kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
         pgd[pg_count].hitgroup.entryFunctionNameIS = "__intersection__ellipsoids";
         pgd[pg_count].hitgroup.moduleIS = config.main_module;
+        pgd[pg_count].hitgroup.moduleAH            = config.main_module;
+        pgd[pg_count].hitgroup.entryFunctionNameAH = "__anyhit__transmittance";
         config.pg_mapping[ShapeType::Ellipsoids] = pg_count++;
     }
 
@@ -690,7 +710,7 @@ OptixAccel<Float, Spectrum>::ray_intersect_preliminary(
     Mask active) const {
     MiOptixSceneState &s = *state;
 
-    UInt32 ray_mask(255),
+    UInt32 ray_mask(ray.mask),
            ray_flags(OPTIX_RAY_FLAG_DISABLE_ANYHIT |
                      OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT),
            sbt_offset(0), sbt_stride(1), miss_sbt_index(0);
@@ -768,7 +788,7 @@ OptixAccel<Float, Spectrum>::ray_test(const Scene<Float, Spectrum> * /*scene*/,
                                       Mask active) const {
     MiOptixSceneState &s = *state;
 
-    UInt32 ray_mask(255),
+    UInt32 ray_mask(ray.mask),
            ray_flags(OPTIX_RAY_FLAG_DISABLE_ANYHIT |
                      OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT |
                      OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT),
@@ -805,6 +825,250 @@ OptixAccel<Float, Spectrum>::ray_test(const Scene<Float, Spectrum> * /*scene*/,
                         s.pipeline_jit_index, s.sbt_jit_index);
 
     return UInt32::steal(hitobject_out) != 0;
+}
+
+template <typename Float, typename Spectrum>
+Float OptixAccel<Float, Spectrum>::ray_transmittance_ellipsoids(
+    const Scene<Float, Spectrum> * /*scene*/, const Ray3f &ray,
+    const UInt32 &seed, uint32_t mode_flags, Mask active) const {
+    MiOptixSceneState &s = *state;
+
+    bool stochastic =
+        (mode_flags & +RayFlags::StochasticEllipsoids) != 0;
+
+    // One any-hit-driven traversal: ellipsoid primitives either accumulate
+    // their analytic signed optical depth (TransmittanceEllipsoids) or
+    // Bernoulli-test the ray (StochasticEllipsoids); hits on other geometry
+    // are accepted and block the ray. See __anyhit__transmittance.
+    UInt32 ray_mask(ray.mask),
+           ray_flags(OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT |
+                     OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES |
+                     (stochastic ? OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT : 0)),
+           sbt_offset(0), sbt_stride(1), miss_sbt_index(0);
+
+    using Single = dr::float32_array_t<Float>;
+    dr::Array<Single, 3> ray_o(ray.o), ray_d(ray.d);
+    Single ray_mint(0.f), ray_maxt(ray.maxt), ray_time(ray.time);
+
+    if constexpr (!std::is_same_v<Single, Float>)
+        ray_maxt = dr::minimum(ray_maxt, dr::Largest<Single>);
+
+    // Payloads: mi flags, per-ray RNG seed, optical-depth accumulator.
+    UInt32 p_flags(mode_flags), p_seed(seed), p_tau(0u);
+
+    uint32_t trace_args[] {
+        accel_handle.index(),
+        ray_o.x().index(), ray_o.y().index(), ray_o.z().index(),
+        ray_d.x().index(), ray_d.y().index(), ray_d.z().index(),
+        ray_mint.index(), ray_maxt.index(), ray_time.index(),
+        ray_mask.index(), ray_flags.index(),
+        sbt_offset.index(), sbt_stride.index(),
+        miss_sbt_index.index(),
+        p_flags.index(), p_seed.index(), p_tau.index(),
+    };
+
+    OptixHitObjectField field = OptixHitObjectField::IsHit;
+    uint32_t hitobject_out;
+
+    jit_optix_ray_trace(sizeof(trace_args) / sizeof(uint32_t), trace_args,
+                        1, &field, &hitobject_out,
+                        false, 0, 0, /* invoke = */ true, active.index(),
+                        s.pipeline_jit_index, s.sbt_jit_index);
+
+    // The payload argument slots were rewritten with the final payload values.
+    UInt32 out_flags = UInt32::steal(trace_args[15]);
+    UInt32 out_seed  = UInt32::steal(trace_args[16]);
+    UInt32 out_tau   = UInt32::steal(trace_args[17]);
+    (void) out_flags; (void) out_seed;
+
+    Mask hit = UInt32::steal(hitobject_out) != 0;
+
+    Float result;
+    if (stochastic) {
+        // Binary transmittance sample: absorbed (or blocked) -> 0.
+        result = dr::select(hit, Float(0.f), Float(1.f));
+        result = dr::select(active, result, Float(1.f));
+    } else {
+        // Deterministic: return the accumulated *signed optical depth*
+        // itself rather than exp(-tau), which would saturate deep media in
+        // float32. A hit means an opaque blocker -> infinite depth.
+        Single tau = dr::reinterpret_array<Single, UInt32>(out_tau);
+        result = dr::select(hit, Float(dr::Infinity<Single>), Float(tau));
+        result = dr::select(active, result, Float(0.f));
+    }
+    return result;
+}
+
+template <typename Float, typename Spectrum>
+std::tuple<Float, typename OptixAccel<Float, Spectrum>::UInt32,
+           typename OptixAccel<Float, Spectrum>::UInt32,
+           typename OptixAccel<Float, Spectrum>::PreliminaryIntersection3f>
+OptixAccel<Float, Spectrum>::ray_sample_ellipsoids(
+    const Scene<Float, Spectrum> *scene, const Ray3f &ray,
+    const UInt32 &seed, const Float &t_start, Mask active) const {
+    MiOptixSceneState &s = *state;
+
+    // One any-hit-driven traversal: every ellipsoid primitive draws its
+    // closed-form inverse-CDF free flight over the kernel's full support
+    // and min-folds it into the payload (the minimum over independent
+    // per-primitive flights IS the mixture free flight, so traversal order
+    // does not matter); hits on other geometry are accepted, so the
+    // committed hit is the closest blocking surface, returned as a regular
+    // preliminary intersection, and flights past it are discarded below.
+    // ENFORCE_ANYHIT (without back-face culling) makes primitives that
+    // contain the ray origin visible too -- interior-hit reporting in
+    // __intersection__ellipsoids / un-culled mesh back faces -- so no
+    // separate origin handling is needed (duplicate front/back invocations
+    // are idempotent: the stateless per-primitive hash yields the same
+    // flight). See sample_anyhit_ellipsoids in shapes/optix/ellipsoids.cuh.
+    UInt32 ray_mask(ray.mask),
+           ray_flags(OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT |
+                     OPTIX_RAY_FLAG_ENFORCE_ANYHIT),
+           sbt_offset(0), sbt_stride(1), miss_sbt_index(0);
+
+    using Single = dr::float32_array_t<Float>;
+    dr::Array<Single, 3> ray_o(ray.o), ray_d(ray.d);
+    Single ray_mint(0.f), ray_maxt(ray.maxt), ray_time(ray.time);
+
+    if constexpr (!std::is_same_v<Single, Float>)
+        ray_maxt = dr::minimum(ray_maxt, dr::Largest<Single>);
+
+    UInt32 p_flags((uint32_t) +RayFlags::SampleEllipsoids), p_seed(seed),
+           p_tmin(dr::reinterpret_array<UInt32, Single>(
+               Single(dr::Infinity<Single>))),
+           p_win_shape(0xffffffffu), p_win_prim(0u),
+           p_tstart(dr::reinterpret_array<UInt32, Single>(Single(t_start)));
+
+    uint32_t trace_args[] {
+        accel_handle.index(),
+        ray_o.x().index(), ray_o.y().index(), ray_o.z().index(),
+        ray_d.x().index(), ray_d.y().index(), ray_d.z().index(),
+        ray_mint.index(), ray_maxt.index(), ray_time.index(),
+        ray_mask.index(), ray_flags.index(),
+        sbt_offset.index(), sbt_stride.index(),
+        miss_sbt_index.index(),
+        p_flags.index(), p_seed.index(), p_tmin.index(),
+        p_win_shape.index(), p_win_prim.index(), p_tstart.index(),
+    };
+
+    bool has_instances = !scene->m_shapegroups.empty();
+
+    OptixHitObjectField fields[] {
+        OptixHitObjectField::IsHit,
+        OptixHitObjectField::RayTMax,
+        OptixHitObjectField::Attribute0,
+        OptixHitObjectField::Attribute1,
+        OptixHitObjectField::PrimitiveIndex,
+        OptixHitObjectField::SBTDataPointer,
+        OptixHitObjectField::InstanceId
+    };
+    uint32_t hitobject_out[7];
+
+    jit_optix_ray_trace(sizeof(trace_args) / sizeof(uint32_t), trace_args,
+                        has_instances ? 7 : 6, fields, hitobject_out,
+                        false, 0, 0, /* invoke = */ true, active.index(),
+                        s.pipeline_jit_index, s.sbt_jit_index);
+
+    // Payload slots were rewritten with the final values.
+    Single t_min = dr::reinterpret_array<Single, UInt32>(
+        UInt32::steal(trace_args[17]));
+    UInt32 win_shape = UInt32::steal(trace_args[18]);
+    UInt32 win_prim  = UInt32::steal(trace_args[19]);
+    UInt32::steal(trace_args[15]); // release rewritten flags/seed/t_start
+    UInt32::steal(trace_args[16]);
+    UInt32::steal(trace_args[20]);
+
+    // Committed hit = closest non-ellipsoid surface (if any), recovered
+    // exactly like ray_intersect_preliminary.
+    Mask valid_hit = active & (UInt32::steal(hitobject_out[0]) != 0);
+    UInt64 hitobject_sbt_ptr = UInt64::steal(hitobject_out[5]);
+    uint32_t shape_id_idx = jit_optix_sbt_data_load(
+        hitobject_sbt_ptr.index(), VarType::UInt32, 0, valid_hit.index());
+
+    PreliminaryIntersection3f pi;
+    pi.valid      = valid_hit;
+    pi.t          = dr::select(valid_hit,
+        Float(dr::reinterpret_array<Single, UInt32>(UInt32::steal(hitobject_out[1]))),
+        dr::Infinity<Float>);
+    pi.prim_uv[0] = dr::reinterpret_array<Single, UInt32>(UInt32::steal(hitobject_out[2]));
+    pi.prim_uv[1] = dr::reinterpret_array<Single, UInt32>(UInt32::steal(hitobject_out[3]));
+    pi.prim_index = UInt32::steal(hitobject_out[4]);
+    pi.shape      = dr::reinterpret_array<ShapePtr, UInt32>(UInt32::steal(shape_id_idx));
+    pi.instance   = has_instances ? ShapePtr::steal(hitobject_out[6]) : dr::zeros<ShapePtr>();
+    pi.shape_index = dr::zeros<UInt32>();
+
+    // A flight beyond the blocking surface (or the caller's maxt) is void.
+    Float t = dr::select(active & (Float(t_min) < pi.t) &
+                             (Float(t_min) < Float(ray_maxt)),
+                         Float(t_min), dr::Infinity<Float>);
+    return { t, win_shape, win_prim, pi };
+}
+
+template <typename Float, typename Spectrum>
+typename OptixAccel<Float, Spectrum>::UInt32
+OptixAccel<Float, Spectrum>::ray_collect_ellipsoids(
+    const Scene<Float, Spectrum> * /*scene*/, const Ray3f &ray,
+    const UInt64 &slot_addr, uint32_t capacity, Mask active) const {
+    MiOptixSceneState &s = *state;
+
+    // One any-hit traversal collecting the primitives whose extent shell
+    // contains the ray origin into per-ray slots of a caller-provided
+    // buffer. ENFORCE_ANYHIT doubles as the interior-hit-reporting switch
+    // in __intersection__ellipsoids; back faces stay visible so mesh
+    // shells report their forward exit. Nothing is ever committed.
+    UInt32 ray_mask(ray.mask),
+           ray_flags(OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT |
+                     OPTIX_RAY_FLAG_ENFORCE_ANYHIT),
+           sbt_offset(0), sbt_stride(1), miss_sbt_index(0);
+
+    using Single = dr::float32_array_t<Float>;
+    dr::Array<Single, 3> ray_o(ray.o), ray_d(ray.d);
+    Single ray_mint(0.f), ray_maxt(ray.maxt), ray_time(ray.time);
+
+    if constexpr (!std::is_same_v<Single, Float>)
+        ray_maxt = dr::minimum(ray_maxt, dr::Largest<Single>);
+
+    // Per-ray slot addresses are resolved by the caller OUTSIDE symbolic
+    // regions (mi.device_address(buffer) + slot * 2 * capacity * 4): the
+    // buffer's device pointer cannot be queried while recording a
+    // symbolic loop.
+    UInt32 p_flags((uint32_t) +RayFlags::CollectEllipsoids), p_count(0u),
+           p_lo(UInt32(slot_addr & uint64_t(0xffffffffu))),
+           p_hi(UInt32(slot_addr >> 32)),
+           p_cap(capacity);
+
+    uint32_t trace_args[] {
+        accel_handle.index(),
+        ray_o.x().index(), ray_o.y().index(), ray_o.z().index(),
+        ray_d.x().index(), ray_d.y().index(), ray_d.z().index(),
+        ray_mint.index(), ray_maxt.index(), ray_time.index(),
+        ray_mask.index(), ray_flags.index(),
+        sbt_offset.index(), sbt_stride.index(),
+        miss_sbt_index.index(),
+        p_flags.index(), p_count.index(), p_lo.index(), p_hi.index(),
+        p_cap.index(),
+    };
+
+    OptixHitObjectField field = OptixHitObjectField::IsHit;
+    uint32_t hitobject_out;
+
+    jit_optix_ray_trace(sizeof(trace_args) / sizeof(uint32_t), trace_args,
+                        1, &field, &hitobject_out,
+                        false, 0, 0, /* invoke = */ true, active.index(),
+                        s.pipeline_jit_index, s.sbt_jit_index);
+
+    UInt32 count = UInt32::steal(trace_args[16]);
+    UInt32::steal(trace_args[15]);
+    UInt32::steal(trace_args[17]);
+    UInt32::steal(trace_args[18]);
+    UInt32::steal(trace_args[19]);
+    UInt32::steal(hitobject_out);
+
+    // NOTE for callers: the collected pairs are raw device writes the JIT
+    // cannot see. Make every gather of 'buffer' data-depend on the returned
+    // count (e.g. fold '(count & 0)' into the gather index) so it cannot be
+    // scheduled before the traversal.
+    return dr::select(active, count, 0u);
 }
 
 template <typename Float, typename Spectrum>

@@ -24,6 +24,7 @@ template <typename Point_, typename Spectrum_> struct Ray {
                            dr::detail::MaskedArray<dr::value_t<Point>>,
                            dr::value_t<Point>>;
     using ScalarFloat = dr::scalar_t<Float>;
+    using UInt32      = dr::uint32_array_t<Float>;
     using Vector      = mitsuba::Vector<Float, Size>;
     using Spectrum    = Spectrum_;
     using Wavelength  = wavelength_t<Spectrum_>;
@@ -38,25 +39,29 @@ template <typename Point_, typename Spectrum_> struct Ray {
     Float time = (ScalarFloat) 0.f;
     /// Wavelength associated with the ray
     Wavelength wavelengths;
+    /// Per-ray visibility mask: a hit requires ``ray.mask & shape.visibility_mask()``
+    /// (forwarded to the OptiX/Embree trace; default 0xFF = visible to all).
+    UInt32 mask = (UInt32) 0xFF;
 
     /// Construct a new ray (o, d) at time 'time'
     Ray(const Point &o, const Vector &d, Float time,
-        const Wavelength &wavelengths)
-        : o(o), d(d), time(time), wavelengths(wavelengths) { }
+        const Wavelength &wavelengths, const UInt32 &mask = (UInt32) 0xFF)
+        : o(o), d(d), time(time), wavelengths(wavelengths), mask(mask) { }
 
     /// Construct a new ray (o, d) with time
-    Ray(const Point &o, const Vector &d, const Float &time = (ScalarFloat) 0.f)
-        : o(o), d(d), time(time) { }
+    Ray(const Point &o, const Vector &d, const Float &time = (ScalarFloat) 0.f,
+        const UInt32 &mask = (UInt32) 0xFF)
+        : o(o), d(d), time(time), mask(mask) { }
 
     /// Construct a new ray (o, d) with bounds
     Ray(const Point &o, const Vector &d, Float maxt, Float time,
-        const Wavelength &wavelengths)
-        : o(o), d(d), maxt(maxt), time(time), wavelengths(wavelengths) {}
+        const Wavelength &wavelengths, const UInt32 &mask = (UInt32) 0xFF)
+        : o(o), d(d), maxt(maxt), time(time), wavelengths(wavelengths), mask(mask) {}
 
     /// Copy a ray, but change the maxt value
     Ray(const Ray &r, Float maxt)
         : o(r.o), d(r.d), maxt(maxt),
-          time(r.time), wavelengths(r.wavelengths) { }
+          time(r.time), wavelengths(r.wavelengths), mask(r.mask) { }
 
     /// Return the position of a point along the ray
     Point operator() (Float t) const { return dr::fmadd(d, t, o); }
@@ -69,10 +74,11 @@ template <typename Point_, typename Spectrum_> struct Ray {
         result.maxt        = maxt;
         result.time        = time;
         result.wavelengths = wavelengths;
+        result.mask        = mask;
         return result;
     }
 
-    DRJIT_STRUCT(Ray, o, d, maxt, time, wavelengths)
+    DRJIT_STRUCT(Ray, o, d, maxt, time, wavelengths, mask)
 };
 
 /**
@@ -83,8 +89,8 @@ template <typename Point_, typename Spectrum_>
 struct RayDifferential : Ray<Point_, Spectrum_> {
     using Base = Ray<Point_, Spectrum_>;
 
-    MI_USING_TYPES(Float, ScalarFloat, Point, Vector, Wavelength)
-    MI_USING_MEMBERS(o, d, maxt, time, wavelengths)
+    MI_USING_TYPES(Float, ScalarFloat, Point, Vector, Wavelength, UInt32)
+    MI_USING_MEMBERS(o, d, maxt, time, wavelengths, mask)
 
     Point o_x, o_y;
     Vector d_x, d_y;
@@ -96,12 +102,13 @@ struct RayDifferential : Ray<Point_, Spectrum_> {
 
     /// Construct a new ray (o, d) at time 'time'
     RayDifferential(const Point &o_, const Vector &d_, Float time_ = (ScalarFloat) 0.f,
-                    const Wavelength &wavelengths_ = Wavelength())
+                    const Wavelength &wavelengths_ = Wavelength(), UInt32 mask_ = (UInt32) 0xFF)
         : o_x(0), o_y(0), d_x(0), d_y(0), has_differentials(false) {
         o           = o_;
         d           = d_;
         time        = time_;
         wavelengths = wavelengths_;
+        mask        = mask_;
     }
 
     void scale_differential(Float amount) {
@@ -112,7 +119,7 @@ struct RayDifferential : Ray<Point_, Spectrum_> {
     }
 
     DRJIT_STRUCT(RayDifferential, o, d, maxt, time,
-                 wavelengths, o_x, o_y, d_x, d_y)
+                 wavelengths, mask, o_x, o_y, d_x, d_y)
 };
 
 /// Return a string representation of the ray

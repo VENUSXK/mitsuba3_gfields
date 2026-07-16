@@ -54,6 +54,42 @@ enum class RayFlags : uint32_t {
     DetachShape = 0x100,
 
     // =============================================================
+    //!        Volumetric-primitive any-hit flags (OptiX only)
+    // =============================================================
+
+    /// Force-disable any-hit shader execution for this ray
+    NoInvoke = 0x800,
+
+    /// Per-primitive Bernoulli transmittance tests in the any-hit shader
+    /// (ellipsoids): each intersected primitive absorbs the ray with its
+    /// analytic full-line opacity; traversal stops at the first absorption.
+    /// Used by \ref Scene::ray_transmittance_ellipsoids().
+    StochasticEllipsoids = 0x1000,
+
+    /// Accumulate the analytic signed optical depth of every intersected
+    /// ellipsoid primitive in the any-hit shader (all such hits are ignored;
+    /// the sum returns via payload). Order-independent and deterministic.
+    /// Used by \ref Scene::ray_transmittance_ellipsoids().
+    TransmittanceEllipsoids = 0x2000,
+
+    /// Free-flight distance sampling in the any-hit shader (ellipsoids):
+    /// each intersected primitive draws its closed-form inverse-CDF free
+    /// flight over the kernel's full support (stateless per-primitive RNG)
+    /// and min-folds it into the payload; non-ellipsoid hits commit and
+    /// clip the query. One traversal composes the exact mixture free
+    /// flight (min of independent flights).
+    /// Used by \ref Scene::ray_sample_ellipsoids().
+    SampleEllipsoids = 0x4000,
+
+    /// Collect the ellipsoid primitives whose extent shells contain the ray
+    /// origin into a caller-provided device buffer (any-hit shader writes
+    /// (shape_registry_id, prim_index) pairs; the count returns via
+    /// payload). Requires interior-hit reporting, enabled by tracing with
+    /// OPTIX_RAY_FLAG_ENFORCE_ANYHIT. Used by
+    /// \ref Scene::ray_collect_ellipsoids().
+    CollectEllipsoids = 0x8000,
+
+    // =============================================================
     //!                 Compound compute flags
     // =============================================================
 

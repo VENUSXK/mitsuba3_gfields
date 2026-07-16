@@ -165,6 +165,15 @@ public:
     Ellipsoids(const Properties &props) : Base(props) {
         m_shape_type = ShapeType::Ellipsoids;
 
+        m_kernel_type = props.get<uint32_t>(
+            "kernel_type", props.get<bool>("is_gabor", false) ? 1u : 0u);
+        if (props.has_property("visibility_mask")) {
+            int mask = props.get<int>("visibility_mask");
+            if (mask < 0 || mask > 255)
+                Throw("visibility_mask must be in [0, 255], got %i", mask);
+            m_visibility_mask = (uint32_t) mask;
+        }
+
         Timer timer;
 
         m_ellipsoids = EllipsoidsData<Float, Spectrum>(props);
@@ -435,15 +444,23 @@ public:
 #if defined(MI_ENABLE_CUDA)
         if constexpr (dr::is_cuda_v<Float>) {
             // OptiX zero-copy: the AABBs are precomputed on the device, and the
-            // SBT data is just two device pointers into the ellipsoid arrays.
+            // SBT data is just device pointers into the ellipsoid arrays. The
+            // opacity/omega attribute pointers feed the any-hit transmittance
+            // queries (nullptr when the attribute is absent).
             g.data_size = sizeof(OptixEllipsoidsData);
             g.aabb_buffer = m_device_bboxes;
             g.fill_data = [](const void *ctx, void *out) {
                 auto *self = const_cast<Ellipsoids *>(
                     static_cast<const Ellipsoids *>(ctx));
+                auto &attrs = self->m_ellipsoids.attributes();
+                auto it_op = attrs.find("opacities");
+                auto it_om = attrs.find("omega");
                 *static_cast<OptixEllipsoidsData *>(out) = OptixEllipsoidsData{
                     self->m_ellipsoids.extents_data().data(),
-                    self->m_ellipsoids.data().data()
+                    self->m_ellipsoids.data().data(),
+                    it_op != attrs.end() ? it_op.value().data() : nullptr,
+                    it_om != attrs.end() ? it_om.value().data() : nullptr,
+                    1u
                 };
             };
         }
@@ -564,9 +581,12 @@ public:
         }
     }
 
+    uint32_t kernel_type() const override { return m_kernel_type; }
+
     MI_DECLARE_CLASS(Ellipsoids)
 
 private:
+    uint32_t m_kernel_type = 0;
 
     /// Helper routine to recompute the bounding boxes of all ellipsoids.
     void recompute_bbox() {

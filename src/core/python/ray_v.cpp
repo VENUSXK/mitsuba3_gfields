@@ -40,10 +40,11 @@ void bind_ray(nb::module_ &m, const char *name) {
             .def_field(Ray, maxt,        D(Ray, maxt))
             .def_field(Ray, time,        D(Ray, time))
             .def_field(Ray, wavelengths, D(Ray, wavelengths))
+            .def_field(Ray, mask,        D(Ray, mask))
             .def_repr(Ray);
 
         if constexpr (dr::is_jit_v<RayFloat>) {
-            MI_PY_DRJIT_STRUCT(ray, Ray, o, d, maxt, time, wavelengths);
+            MI_PY_DRJIT_STRUCT(ray, Ray, o, d, maxt, time, wavelengths, mask);
         }
     }
 }
@@ -79,7 +80,7 @@ MI_PY_EXPORT(Ray) {
             .def_field(RayDifferential3f, has_differentials, D(RayDifferential, has_differentials));
 
         MI_PY_DRJIT_STRUCT(raydiff, RayDifferential3f, o, d, maxt, time,
-                            wavelengths, o_x, o_y, d_x, d_y)
+                            wavelengths, mask, o_x, o_y, d_x, d_y)
     }
 
     nb::implicitly_convertible<Ray3f, RayDifferential3f>();

@@ -55,6 +55,9 @@ struct ShapeIR {
     /// only; Metal uses its own per-BLAS lookup table).
     uint32_t data_slot = (uint32_t) -1;
 
+    /// 8-bit instance/geometry visibility mask (see \ref Shape::visibility_mask()).
+    uint32_t visibility_mask = 255;
+
     // --- Triangles (mesh, ellipsoidsmesh) ---
 
     /// Backend-appropriate buffer handles (host pointer on CPU/Embree, device
@@ -114,6 +117,9 @@ struct InstanceEntry {
 
     /// JIT registry ID of the ShapeGroup, or ``SCENE_IR_NO_OWNER``.
     uint32_t owner_registry_id = SCENE_IR_NO_OWNER;
+
+    /// OptiX/Metal instance visibility mask (see \ref Shape::visibility_mask()).
+    uint32_t visibility_mask = 255;
 };
 
 /// Scene description consumed by acceleration-structure builders.

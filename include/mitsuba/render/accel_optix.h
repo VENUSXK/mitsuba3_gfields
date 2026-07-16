@@ -8,6 +8,7 @@
 
 #include <mitsuba/render/fwd.h>
 #include <drjit/array_traverse.h>
+#include <tuple>
 
 NAMESPACE_BEGIN(mitsuba)
 
@@ -38,6 +39,27 @@ struct OptixAccel {
         Mask active) const;
     Mask ray_test(const Scene<Float, Spectrum> *scene, const Ray3f &ray,
                   Mask coherent, Mask active) const;
+    /// Any-hit-driven ellipsoid transmittance query
+    /// (see \ref Scene::ray_transmittance_ellipsoids).
+    Float ray_transmittance_ellipsoids(const Scene<Float, Spectrum> *scene,
+                                       const Ray3f &ray, const UInt32 &seed,
+                                       uint32_t mode_flags, Mask active) const;
+    /// Any-hit-driven ellipsoid free-flight distance sampling
+    /// (see \ref Scene::ray_sample_ellipsoids). Returns the sampled flight
+    /// (world t; +inf when no collision before the closest blocking
+    /// surface), the winning primitive's shape registry id and primitive
+    /// index, and the blocking surface as a preliminary intersection.
+    std::tuple<Float, UInt32, UInt32, PreliminaryIntersection3f>
+    ray_sample_ellipsoids(const Scene<Float, Spectrum> *scene,
+                          const Ray3f &ray, const UInt32 &seed,
+                          const Float &t_start, Mask active) const;
+    /// Any-hit-driven collection of the ellipsoid primitives containing the
+    /// ray origin (see \ref Scene::ray_collect_ellipsoids). Writes up to
+    /// `capacity` (shape_registry_id, prim_index) pairs per ray at the
+    /// per-lane device address `slot_addr` and returns the per-ray count.
+    UInt32 ray_collect_ellipsoids(const Scene<Float, Spectrum> *scene,
+                                  const Ray3f &ray, const UInt64 &slot_addr,
+                                  uint32_t capacity, Mask active) const;
     /// OptiX exposes no brute-force traversal, so this throws.
     SurfaceInteraction3f ray_intersect_naive(
         const Scene<Float, Spectrum> *scene, const Ray3f &ray,

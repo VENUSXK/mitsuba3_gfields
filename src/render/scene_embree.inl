@@ -132,6 +132,7 @@ embree_make_geometry(RTCDevice device, const Shape<Float, Spectrum> *shape,
             rtcSetGeometryBoundsFunction(geom, embree_bbox<Float, Spectrum>, nullptr);
             rtcSetGeometryIntersectFunction(geom, embree_intersect<Float, Spectrum>);
             rtcSetGeometryOccludedFunction(geom, embree_occluded<Float, Spectrum>);
+            rtcSetGeometryMask(geom, (unsigned int) g.visibility_mask);
             rtcCommitGeometry(geom);
             return geom;
         }
@@ -149,6 +150,7 @@ embree_make_geometry(RTCDevice device, const Shape<Float, Spectrum> *shape,
                 rtcSetGeometryIntersectFilterFunction(geom, embree_backface_cull);
                 rtcSetGeometryOccludedFilterFunction(geom, embree_backface_cull);
             }
+            rtcSetGeometryMask(geom, (unsigned int) g.visibility_mask);
             rtcCommitGeometry(geom);
             return geom;
         }
@@ -392,7 +394,7 @@ EmbreeAccel<Float, Spectrum>::ray_intersect_preliminary(
         dr::store(&rh.ray.org_x, dr::concat(Vector3s(ray.o), float(0.f)));
         dr::store(&rh.ray.dir_x, dr::concat(Vector3s(ray.d), float(ray.time)));
         rh.ray.tfar = ray_maxt;
-        rh.ray.mask = 0;
+        rh.ray.mask = (unsigned int) dr::slice(ray.mask);
         rh.ray.id = 0;
         rh.ray.flags = 0;
         rh.hit.geomID = (uint32_t) -1;
@@ -471,7 +473,7 @@ EmbreeAccel<Float, Spectrum>::ray_test(const Scene<Float, Spectrum> * /*scene*/,
         dr::store(&ray2.org_x, dr::concat(Vector3s(ray.o), float(0.f)));
         dr::store(&ray2.dir_x, dr::concat(Vector3s(ray.d), float(ray.time)));
         ray2.tfar = (float) ray_maxt;
-        ray2.mask = 0;
+        ray2.mask = (unsigned int) dr::slice(ray.mask);
         ray2.id = 0;
         ray2.flags = 0;
 

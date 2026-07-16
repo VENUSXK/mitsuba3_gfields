@@ -12,6 +12,10 @@
     #include <embree3/rtcore.h>
 #endif
 
+#if defined(MI_ENABLE_CUDA)
+    #include "optix/ellipsoids.cuh"
+#endif
+
 NAMESPACE_BEGIN(mitsuba)
 
 /// Forward declaration of template shell mesh data buffers
@@ -140,6 +144,20 @@ public:
 
     EllipsoidsMesh(const Properties &props) : Base(props) {
         m_shape_type = ShapeType::EllipsoidsMesh;
+
+        // Kernel-type marker (generalises the old boolean 'is_gabor'); accept the
+        // legacy 'is_gabor' as a shorthand for kernel_type=1.
+        m_kernel_type = props.get<uint32_t>(
+            "kernel_type", props.get<bool>("is_gabor", false) ? 1u : 0u);
+
+        // 8-bit visibility mask for OptiX/Embree instance-level LOD pruning
+        // (single-bit value, or 255 = all rays).
+        if (props.has_property("visibility_mask")) {
+            int mask = props.get<int>("visibility_mask");
+            if (mask < 0 || mask > 255)
+                Throw("visibility_mask must be in [0, 255], got %i", mask);
+            m_visibility_mask = (uint32_t) mask;
+        }
 
         Timer timer;
 
@@ -378,9 +396,14 @@ public:
         }
     }
 
+    /// Kernel-type marker for the primitives in this shape (0=Gaussian, 1=Gabor, ...)
+    uint32_t kernel_type() const override { return m_kernel_type; }
+
     MI_DECLARE_CLASS(EllipsoidsMesh)
 
 private:
+    uint32_t m_kernel_type = 0;
+
     void recompute_mesh() {
         if constexpr (dr::is_jit_v<Float>) {
             UInt32 idx = dr::arange<UInt32>(m_ellipsoids.count());
@@ -485,6 +508,29 @@ private:
         // Mesh::describe() tags this as plain Triangles. Refine it to the
         // back-face-culled bucket (the only kind both GPU backends cull).
         g.kind = ShapeIR::Kind::TrianglesCulled;
+
+#if defined(MI_ENABLE_CUDA)
+        if constexpr (dr::is_cuda_v<Float>) {
+            // SBT data for the any-hit transmittance queries: device pointers
+            // into the ellipsoid arrays plus the triangle-to-primitive
+            // divisor (triangles per shell instance).
+            g.data_size = sizeof(OptixEllipsoidsData);
+            g.fill_data = [](const void *ctx, void *out) {
+                auto *self = const_cast<EllipsoidsMesh *>(
+                    static_cast<const EllipsoidsMesh *>(ctx));
+                auto &attrs = self->m_ellipsoids.attributes();
+                auto it_op = attrs.find("opacities");
+                auto it_om = attrs.find("omega");
+                *static_cast<OptixEllipsoidsData *>(out) = OptixEllipsoidsData{
+                    self->m_ellipsoids.extents_data().data(),
+                    self->m_ellipsoids.data().data(),
+                    it_op != attrs.end() ? it_op.value().data() : nullptr,
+                    it_om != attrs.end() ? it_om.value().data() : nullptr,
+                    (unsigned int) self->m_shell_faces.size()
+                };
+            };
+        }
+#endif
     }
 
 private:

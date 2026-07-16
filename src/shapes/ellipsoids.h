@@ -262,7 +262,24 @@ public:
 
         m_data_pointer = m_data.data();
 
-        m_extent_multiplier = props.get<ScalarFloat>("extent", 3.f);
+        // 'extent' accepts either a uniform scalar or a per-primitive tensor of
+        // shape (N,) / (N, 1) (e.g. produced by adaptive extent clamping in the
+        // LOD pipeline). A tensor bypasses the scalar multiplier in compute_extents().
+        if (props.has_property("extent") &&
+            props.type("extent") != Properties::Type::Float) {
+            const TensorXf &extent_tensor = props.get_any<TensorXf>("extent");
+            size_t n_extents = extent_tensor.ndim() == 1
+                ? extent_tensor.shape(0)
+                : extent_tensor.shape(0) * extent_tensor.shape(1);
+            if (n_extents != count())
+                Throw("Tensor \"extent\" must have shape (N,) or (N, 1) matching "
+                      "the primitive count (%u vs %u)", n_extents, count());
+            m_extent_tensor = extent_tensor.array();
+            m_has_extent_tensor = true;
+            m_extent_multiplier = 3.f;
+        } else {
+            m_extent_multiplier = props.get<ScalarFloat>("extent", 3.f);
+        }
         m_extent_adaptive_clamping = props.get<bool>("extent_adaptive_clamping", false);
 
         // Load any other ellipsoids attributes
@@ -311,7 +328,9 @@ public:
     }
 
     void compute_extents() {
-        if (m_extent_adaptive_clamping) {
+        if (m_has_extent_tensor) {
+            m_extents = m_extent_tensor;
+        } else if (m_extent_adaptive_clamping) {
             auto indices = dr::arange<UInt32Storage>(count());
             FloatStorage opacities = dr::gather<FloatStorage>(m_attributes["opacities"], indices);
             float alpha = 0.01f; // minimum response of the Gaussian
@@ -483,6 +502,9 @@ private:
     ScalarFloat m_extent_multiplier;
     bool m_extent_adaptive_clamping;
     FloatStorage m_extents;
+    /// Optional per-primitive extents supplied directly as a tensor 'extent'
+    FloatStorage m_extent_tensor;
+    bool m_has_extent_tensor = false;
 
     /// The pointer to the ellipsoid extents data above (used in Embree's kernel)
     float *m_extents_pointer;

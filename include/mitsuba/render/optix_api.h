@@ -47,6 +47,7 @@ using OptixOpacityMicromapArrayIndexingMode       = int;
 
 #define OPTIX_GEOMETRY_FLAG_NONE                          0
 #define OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT                (1 << 0)
+#define OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL    (1 << 1)
 
 #define OPTIX_INDICES_FORMAT_UNSIGNED_INT3 0x2103
 #define OPTIX_VERTEX_FORMAT_FLOAT3         0x2121
@@ -93,6 +94,7 @@ using OptixOpacityMicromapArrayIndexingMode       = int;
 
 #define OPTIX_RAY_FLAG_NONE                       0
 #define OPTIX_RAY_FLAG_DISABLE_ANYHIT             (1u << 0)
+#define OPTIX_RAY_FLAG_ENFORCE_ANYHIT             (1u << 1)
 #define OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT     (1u << 2)
 #define OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT         (1u << 3)
 #define OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES (1u << 4)

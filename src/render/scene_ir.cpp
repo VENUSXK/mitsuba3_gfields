@@ -8,6 +8,17 @@
 
 NAMESPACE_BEGIN(mitsuba)
 
+namespace {
+
+/// Propagate a single-shape BLAS visibility mask to its TLAS instance.
+uint32_t blas_instance_visibility_mask(const BlasEntry &blas) {
+    if (blas.geoms.size() == 1)
+        return blas.geoms[0].visibility_mask;
+    return 255u;
+}
+
+} // namespace
+
 template <typename Float, typename Spectrum>
 SceneIR SceneIRBuilder<Float, Spectrum>::build(Scene<Float, Spectrum> *scene) {
     SceneIR sd;
@@ -25,6 +36,7 @@ SceneIR SceneIRBuilder<Float, Spectrum>::build(Scene<Float, Spectrum> *scene) {
     for (size_t i = 0; i < shapes.size(); ++i) {
         ShapeIR g;
         shapes[i]->describe(g);
+        g.visibility_mask = shapes[i]->visibility_mask();
         g.data_slot = slot++;
         if (g.kind == ShapeIR::Kind::Instance)
             inst_shapes.push_back(std::move(g));
@@ -38,6 +50,7 @@ SceneIR SceneIRBuilder<Float, Spectrum>::build(Scene<Float, Spectrum> *scene) {
         group_geoms[i].resize(children.size());
         for (size_t j = 0; j < children.size(); ++j) {
             children[j]->describe(group_geoms[i][j]);
+            group_geoms[i][j].visibility_mask = children[j]->visibility_mask();
             group_geoms[i][j].data_slot = slot++;
         }
     }
@@ -45,16 +58,30 @@ SceneIR SceneIRBuilder<Float, Spectrum>::build(Scene<Float, Spectrum> *scene) {
     // Move same-kind geometry into one BLAS each (enumerator order), appending
     // them to sd.blases and reporting their indices. Instances have already been
     // routed away, so every geom here belongs to a geometry kind.
+    //
+    // TrianglesCulled (EllipsoidsMesh) is split into one BLAS per shape so
+    // each pyramid level can carry its own OptiX/Metal instance visibility
+    // mask for hardware LOD pruning via ray.mask.
     auto bucket_into_blases = [&](std::vector<ShapeIR> &&geoms,
                                   std::vector<uint32_t> &out_indices) {
         std::vector<ShapeIR> buckets[NumGeometryKinds];
-        for (ShapeIR &g : geoms)
-            buckets[(size_t) g.kind].push_back(std::move(g));
+        std::vector<ShapeIR> culled_individual;
+        for (ShapeIR &g : geoms) {
+            if (g.kind == ShapeIR::Kind::TrianglesCulled)
+                culled_individual.push_back(std::move(g));
+            else
+                buckets[(size_t) g.kind].push_back(std::move(g));
+        }
         for (size_t k = 0; k < NumGeometryKinds; ++k) {
-            if (buckets[k].empty())
+            if (k == (size_t) ShapeIR::Kind::TrianglesCulled || buckets[k].empty())
                 continue;
             out_indices.push_back((uint32_t) sd.blases.size());
             sd.blases.push_back(BlasEntry{ (ShapeIR::Kind) k, std::move(buckets[k]) });
+        }
+        for (ShapeIR &g : culled_individual) {
+            out_indices.push_back((uint32_t) sd.blases.size());
+            sd.blases.push_back(
+                BlasEntry{ ShapeIR::Kind::TrianglesCulled, { std::move(g) } });
         }
     };
 
@@ -73,6 +100,7 @@ SceneIR SceneIRBuilder<Float, Spectrum>::build(Scene<Float, Spectrum> *scene) {
     for (uint32_t bi : sd.top_blases) {
         InstanceEntry e;
         e.blas_index = bi;
+        e.visibility_mask = blas_instance_visibility_mask(sd.blases[bi]);
         sd.instances.push_back(e);
     }
     // ...then, per Instance shape, one instance per BLAS of its ShapeGroup.
@@ -82,6 +110,7 @@ SceneIR SceneIRBuilder<Float, Spectrum>::build(Scene<Float, Spectrum> *scene) {
             InstanceEntry e;
             e.blas_index = bi;
             e.owner_registry_id = owner;
+            e.visibility_mask = blas_instance_visibility_mask(sd.blases[bi]);
             for (int k = 0; k < 12; ++k)
                 e.to_world[k] = inst.to_world[k];
             sd.instances.push_back(e);

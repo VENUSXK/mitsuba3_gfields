@@ -27,8 +27,12 @@ MiOptixAccelData::~MiOptixAccelData() {
 /// pointer at pack time; \ref optix_refresh_shape_data writes the data.
 static void *optix_shape_data_ptr(const ShapeIR &g,
                                   ShapeDataBuffers &data_buffers) {
+    // Custom (implicit) shapes carry SBT data; so does EllipsoidsMesh
+    // (TrianglesCulled), whose any-hit program reads the per-primitive
+    // ellipsoid data for stochastic/accumulated transmittance queries.
     if (g.type == ShapeType::ShapeGroup ||
-        g.kind != ShapeIR::Kind::Custom)
+        (g.kind != ShapeIR::Kind::Custom &&
+         g.kind != ShapeIR::Kind::TrianglesCulled))
         return nullptr;
     size_t data_size = g.data_size_bytes();
     if (!data_size || !g.fill_data || g.data_slot == (uint32_t) -1)
@@ -85,7 +89,8 @@ void fill_hitgroup_records(const std::vector<BlasEntry> &blases,
     for (const BlasEntry &b : blases) {
         for (const ShapeIR &g : b.geoms) {
             void *data = optix_shape_data_ptr(g, data_buffers);
-            HitGroupSbtRecord rec{ { jit_registry_id(g.ctx), data } };
+            HitGroupSbtRecord rec{
+                { jit_registry_id(g.ctx), (uint32_t) g.type, data } };
             uint32_t pg_index = pg_mapping.at(g.type);
             jit_optix_check(optixSbtRecordPackHeader(pg[pg_index], &rec));
             out[cursor++] = rec;
@@ -108,7 +113,11 @@ static void optix_fill_build_input(OptixBuildInput &build_input,
                                    void *ptr_storage[2]) {
     static const uint32_t flags_disable_anyhit[1] =
         { OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT };
-    static const uint32_t flags_none[1] = { OPTIX_GEOMETRY_FLAG_NONE };
+    // Any-hit-capable geometry requires single-invocation semantics: the
+    // transmittance accumulator must add each primitive exactly once (BVHs
+    // may otherwise re-test a primitive multiple times).
+    static const uint32_t flags_anyhit_once[1] =
+        { OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL };
 
     switch (g.kind) {
         case ShapeIR::Kind::Triangles:
@@ -121,7 +130,12 @@ static void optix_fill_build_input(OptixBuildInput &build_input,
             build_input.triangleArray.vertexBuffers    = (CUdeviceptr *) &ptr_storage[0];
             build_input.triangleArray.numIndexTriplets = (unsigned int) g.face_count;
             build_input.triangleArray.indexBuffer      = (CUdeviceptr) g.index_ptr;
-            build_input.triangleArray.flags            = flags_disable_anyhit;
+            // EllipsoidsMesh (TrianglesCulled) supports any-hit transmittance
+            // queries; ordinary meshes keep any-hit disabled (regular rays
+            // additionally disable any-hit per-ray, so this costs nothing).
+            build_input.triangleArray.flags            =
+                g.kind == ShapeIR::Kind::TrianglesCulled ? flags_anyhit_once
+                                                         : flags_disable_anyhit;
             build_input.triangleArray.numSbtRecords    = 1;
             break;
 
@@ -158,7 +172,7 @@ static void optix_fill_build_input(OptixBuildInput &build_input,
             build_input.customPrimitiveArray.numPrimitives = (unsigned int) g.prim_count;
             build_input.customPrimitiveArray.strideInBytes = 6 * sizeof(float);
             build_input.customPrimitiveArray.flags         =
-                g.type == ShapeType::Ellipsoids ? flags_none
+                g.type == ShapeType::Ellipsoids ? flags_anyhit_once
                                                 : flags_disable_anyhit;
             build_input.customPrimitiveArray.numSbtRecords = 1;
             break;
@@ -392,7 +406,7 @@ void prepare_ias(const SceneIR &sd,
               t[4], t[5], t[6],  t[7],
               t[8], t[9], t[10], t[11] },
             instance_id, blas_sbt_offset[inst.blas_index],
-            /* visibilityMask = */ 255, flags,
+            inst.visibility_mask, flags,
             blas_handle[inst.blas_index], /* pads = */ { 0, 0 }
         };
     }

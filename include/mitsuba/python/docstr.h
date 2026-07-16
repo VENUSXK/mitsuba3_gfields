@@ -7852,6 +7852,8 @@ static const char *__doc_mitsuba_Ray_labels = R"doc()doc";
 
 static const char *__doc_mitsuba_Ray_maxt = R"doc(Maximum position on the ray segment)doc";
 
+static const char *__doc_mitsuba_Ray_mask = R"doc(Per-ray visibility mask: a hit requires ray.mask & shape.visibility_mask() (default 0xFF))doc";
+
 static const char *__doc_mitsuba_Ray_name = R"doc()doc";
 
 static const char *__doc_mitsuba_Ray_o = R"doc(Ray origin)doc";
@@ -9978,6 +9980,12 @@ static const char *__doc_mitsuba_Shape_sensor_2 = R"doc(Return the area sensor a
 static const char *__doc_mitsuba_Shape_set_bsdf = R"doc(Set the shape's BSDF)doc";
 
 static const char *__doc_mitsuba_Shape_shape_type = R"doc(Returns the shape type ShapeType of this shape)doc";
+
+static const char *__doc_mitsuba_Shape_kernel_type = R"doc(Kernel-type marker for volumetric-primitive shapes (0=Gaussian, 1=Gabor, ...))doc";
+
+static const char *__doc_mitsuba_Shape_is_gabor = R"doc(Convenience: does this shape hold Gabor (frequency-modulated) primitives? (kernel_type()==1))doc";
+
+static const char *__doc_mitsuba_Shape_visibility_mask = R"doc(8-bit OptiX/Embree instance visibility mask: a ray hits this shape only when ray.mask & visibility_mask() is non-zero)doc";
 
 static const char *__doc_mitsuba_Shape_silhouette_discontinuity_types = R"doc(//! @{ \name Silhouette sampling routines and other utilities)doc";
 

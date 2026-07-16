@@ -315,6 +315,127 @@ public:
     Mask ray_test(const Ray3f &ray, Mask coherent, Mask active) const;
 
     /**
+     * \brief Estimate the transmittance of ellipsoid (volumetric-primitive)
+     * mixtures along a ray with a single any-hit-driven traversal
+     * (CUDA/OptiX only).
+     *
+     * The behavior is selected by \c mode_flags (see \ref RayFlags):
+     *
+     * <ul>
+     * <li>\c RayFlags::TransmittanceEllipsoids — every intersected ellipsoid
+     * primitive adds its analytic full-line signed optical depth to a
+     * payload accumulator and the hit is ignored. The result is the
+     * deterministic <tt>sum tau_i</tt> — the signed optical depth itself
+     * (order-independent, so unordered BVH traversal is exact; returning
+     * tau rather than exp(-tau) avoids float32 saturation in deep media).
+     * Suited to absorption-only / tomography evaluation of primary rays.
+     * A hit on a non-ellipsoid shape returns +infinity.</li>
+     *
+     * <li>\c RayFlags::StochasticEllipsoids — every intersected primitive
+     * performs a Bernoulli test with survival probability
+     * <tt>min(1, exp(-tau_i))</tt> using a stateless hash of \c seed and the
+     * primitive index; the traversal terminates at the first absorption.
+     * The result is an unbiased binary transmittance sample in {0, 1}
+     * (<tt>E[T] = prod min(1, exp(-tau_i))</tt>), suited to shadow rays.
+     * A hit on a non-ellipsoid shape returns 0.</li>
+     * </ul>
+     *
+     * Rays originating inside a shell do not see that primitive (the
+     * shell's front face lies behind the origin), mirroring the hit-walking
+     * integrators; callers handle vertex-enclosing primitives separately.
+     *
+     * \param ray
+     *    Ray segment to evaluate (respects \ref Ray::maxt and \ref Ray::mask)
+     * \param seed
+     *    Per-lane RNG seed (only used with \c StochasticEllipsoids)
+     * \param mode_flags
+     *    \ref RayFlags combination selecting the estimator
+     * \return
+     *    Signed optical depth (\c TransmittanceEllipsoids) or a binary
+     *    transmittance sample (\c StochasticEllipsoids)
+     */
+    Float ray_transmittance_ellipsoids(const Ray3f &ray, const UInt32 &seed,
+                                       uint32_t mode_flags,
+                                       Mask active = true) const;
+
+    /**
+     * \brief Free-flight distance sampling across every ellipsoid primitive
+     * intersected by \c ray in a single any-hit-driven traversal
+     * (CUDA/OptiX only).
+     *
+     * Each intersected primitive draws one closed-form inverse-CDF free
+     * flight over its kernel's full unbounded support (Gaussian kernel
+     * exactly; the Gaussian *envelope* for Gabor primitives) using a
+     * stateless hash of \c seed and the primitive index, and the minimum
+     * flight wins -- which is exactly one free-flight sample of the
+     * (envelope) mixture, since the minimum of independent per-primitive
+     * flights composes their survival probabilities. The extent shells
+     * only act as the BVH proxies that discover primitives. Hits on
+     * non-ellipsoid geometry are committed, so the closest such surface
+     * clips the query and is returned as a regular
+     * \ref PreliminaryIntersection3f (invalid when nothing blocks).
+     *
+     * Unlike \ref ray_transmittance_ellipsoids, primitives containing the
+     * ray origin ARE visible (interior-hit reporting), so no separate
+     * origin-interior handling is needed; every flight starts at
+     * max(t_start, 0) and integrates the remaining forward mass.
+     *
+     * \param ray
+     *    Ray segment to sample (respects \ref Ray::maxt and \ref Ray::mask)
+     * \param seed
+     *    Per-lane RNG seed
+     * \param t_start
+     *    Restart distance (world units): per-primitive flights are drawn
+     *    conditioned on survival past it. Pass 0 for a fresh sample; the
+     *    envelope delta-tracking loop passes the previous tentative
+     *    collision (by the Markov property of the tentative-event process,
+     *    redrawing every chain past t_start is distributionally identical
+     *    to continuing them).
+     * \return
+     *    (t, shape_registry_id, prim_index, pi): the sampled flight
+     *    distance from the ray origin (+inf when every primitive's
+     *    remaining mass ran out before \c ray.maxt / the blocking surface),
+     *    the winning primitive (0xffffffff when t is +inf), and the
+     *    blocking surface's preliminary intersection.
+     */
+    std::tuple<Float, UInt32, UInt32, PreliminaryIntersection3f>
+    ray_sample_ellipsoids(const Ray3f &ray, const UInt32 &seed,
+                          const Float &t_start, Mask active = true) const;
+
+    /**
+     * \brief Collect the ellipsoid primitives whose extent shells contain
+     * the origin of \c ray in a single any-hit-driven traversal
+     * (CUDA/OptiX only).
+     *
+     * Containing primitives become visible through interior-hit reporting
+     * (analytic shells) / un-culled back faces (mesh shells), each firing
+     * exactly once on convex shells; the any-hit program appends
+     * <tt>(shape_registry_id, prim_index)</tt> pairs to this ray's slot of
+     * \c buffer. \c ray.d orients the traversal (any unit vector works) and
+     * \c ray.maxt bounds it: a containing primitive's forward exit lies
+     * within its own diameter, so pass at least twice the largest primitive
+     * radius (or infinity).
+     *
+     * \param slot_addr
+     *    Per-lane device address of this ray's slot inside a
+     *    caller-allocated buffer of at least
+     *    <tt>2 * capacity * lane_count</tt> uint32s:
+     *    <tt>mi.device_address(buffer) + slot * 2 * capacity * 4</tt>,
+     *    resolved OUTSIDE symbolic regions (the buffer must be evaluated
+     *    first; its pointer is baked into the kernel). The JIT cannot see
+     *    the writes: fold the returned count into every subsequent
+     *    gather's index computation (e.g. <tt>idx + (count & 0)</tt>) so
+     *    the reads order after the traversal.
+     * \param capacity
+     *    Maximum pairs per ray; extras are dropped.
+     * \return
+     *    Number of pairs written for this ray.
+     */
+    UInt32 ray_collect_ellipsoids(const Ray3f &ray, const UInt64 &slot_addr,
+                                  uint32_t capacity,
+                                  Mask active = true) const;
+
+    /**
      * \brief Intersect a ray with the shapes comprising the scene and return
      * preliminary information, if one is found
      *

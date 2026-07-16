@@ -816,6 +816,26 @@ public:
     /// Returns the shape type \ref ShapeType of this shape
     uint32_t shape_type() const { return (uint32_t) m_shape_type; }
 
+    /**
+     * \brief Kernel-type marker for volumetric-primitive shapes.
+     *
+     * Generalises the former boolean ``is_gabor`` flag to a small integer so a
+     * wider range of kernel families can be tagged per shape
+     * (0 = plain Gaussian, 1 = Gabor / frequency-modulated Gaussian, ...).
+     * Non-primitive shapes return 0.
+     */
+    virtual uint32_t kernel_type() const { return 0; }
+
+    /// Convenience: does this shape hold Gabor (frequency-modulated) primitives?
+    virtual bool is_gabor() const { return kernel_type() == 1u; }
+
+    /**
+     * \brief 8-bit visibility mask of this shape (OptiX/Embree instance masking).
+     * A ray only intersects this shape when ``ray.mask & visibility_mask()`` is
+     * non-zero; default 255 = visible to all rays.
+     */
+    uint32_t visibility_mask() const { return m_visibility_mask; }
+
     /// Is this shape a shape group?
     bool is_shape_group() const { return (shape_type() == +ShapeType::ShapeGroup); };
 
@@ -948,6 +968,9 @@ protected:
     ref<Medium> m_interior_medium;
     ref<Medium> m_exterior_medium;
     ShapeType m_shape_type = ShapeType::Invalid;
+
+    /// 8-bit OptiX/Embree instance visibility mask (see \ref visibility_mask())
+    uint32_t m_visibility_mask = 255;
 
     uint32_t m_discontinuity_types = (uint32_t) DiscontinuityFlags::Empty;
     /// Sampling weight (proportional to scene)
@@ -1090,6 +1113,9 @@ DRJIT_CALL_TEMPLATE_BEGIN(mitsuba::Shape)
     DRJIT_CALL_GETTER(silhouette_sampling_weight)
     DRJIT_CALL_GETTER(has_flipped_normals)
     DRJIT_CALL_GETTER(shape_type)
+    DRJIT_CALL_GETTER(kernel_type)
+    DRJIT_CALL_GETTER(is_gabor)
+    DRJIT_CALL_GETTER(visibility_mask)
     auto is_emitter() const { return emitter() != nullptr; }
     auto is_sensor() const { return sensor() != nullptr; }
     auto is_mesh() const { return (shape_type() & +mitsuba::ShapeType::Mesh) != 0; }
