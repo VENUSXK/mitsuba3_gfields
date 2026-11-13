@@ -49,13 +49,33 @@ extern "C" __global__ void __anyhit__transmittance() {
         shape_type == (unsigned int) ShapeType::Ellipsoids;
 
     if (is_ellipsoids) {
-        if (mi_ray_flags & MiSampleEllipsoids)
-            sample_anyhit_ellipsoids(sbt_data, prim_index);
-        else if (mi_ray_flags & MiCollectEllipsoids)
-            collect_anyhit_ellipsoids(sbt_data, prim_index);
-        else
-            transmittance_anyhit_ellipsoids(sbt_data->data, prim_index,
-                                            mi_ray_flags);
+        const OptixEllipsoidsData &e = *((const OptixEllipsoidsData *) sbt_data->data);
+        bool grouped = shape_type == (unsigned int) ShapeType::Ellipsoids && e.primitives_per_column > 1;
+        unsigned int count = grouped ? e.primitives_per_column : 1;
+        unsigned int first = grouped ? prim_index * count : prim_index;
+        Ray3f ray = get_ray();
+        if (grouped)
+            ray.maxt = __uint_as_float(optixGetAttribute_1());
+
+        // test child supports and reuse the existing per-gaussian contributions.
+        for (unsigned int k = 0; k < count; ++k) {
+            unsigned int child_index = first + k;
+            float t;
+            unsigned int hit_kind;
+            bool interior = (optixGetRayFlags() & OPTIX_RAY_FLAG_ENFORCE_ANYHIT) != 0;
+            if (grouped && !ellipsoid_support_hit(e, child_index, ray, interior, t, hit_kind))
+                continue;
+
+            // accumulate every child before ignoring the single column event.
+            bool backfacing = grouped ? hit_kind == OPTIX_HIT_KIND_TRIANGLE_BACK_FACE : optixIsBackFaceHit();
+            if (mi_ray_flags & MiSampleEllipsoids)
+                sample_anyhit_ellipsoids(sbt_data, child_index, backfacing);
+            else if (mi_ray_flags & MiCollectEllipsoids)
+                collect_anyhit_ellipsoids(sbt_data, child_index);
+            else if (transmittance_anyhit_ellipsoids(sbt_data->data, child_index, mi_ray_flags))
+                return;
+        }
+        optixIgnoreIntersection();
     } else if (mi_ray_flags & MiCollectEllipsoids) {
         optixIgnoreIntersection();
     }

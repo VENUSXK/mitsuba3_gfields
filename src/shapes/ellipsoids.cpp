@@ -60,6 +60,12 @@ Ellipsoids (:monosp:`ellipsoids`)
    - A tensor of shape (N, 3) specifying the ellipsoid quaternions.
      This parameter cannot be used if `filename` or `data` are provided.
 
+ * - primitives_per_column
+   - |int|
+   - groups this many consecutive gaussian supports into one cuda bvh box.
+     expanded parameter arrays and returned gaussian indices remain unchanged.
+     defaults to one; grouped traversal requires the cuda backend.
+
  * - scale_factor
    - |float|
    - A scaling factor applied to all ellipsoids when loading from a PLY file. (Default: 1.0)
@@ -165,6 +171,16 @@ public:
     Ellipsoids(const Properties &props) : Base(props) {
         m_shape_type = ShapeType::Ellipsoids;
 
+        // group consecutive gaussian supports into one cuda bvh primitive.
+        int64_t primitives_per_column = props.get<int64_t>("primitives_per_column", 1);
+        if (primitives_per_column <= 0 || primitives_per_column > UINT32_MAX)
+            Throw("primitives_per_column must be positive");
+        m_primitives_per_column = (uint32_t) primitives_per_column;
+        if constexpr (!dr::is_cuda_v<Float>) {
+            if (m_primitives_per_column > 1)
+                Throw("Grouped column BVH requires the CUDA backend");
+        }
+
         m_kernel_type = props.get<uint32_t>(
             "kernel_type", props.get<bool>("is_gabor", false) ? 1u : 0u);
         if (props.has_property("visibility_mask")) {
@@ -177,6 +193,8 @@ public:
         Timer timer;
 
         m_ellipsoids = EllipsoidsData<Float, Spectrum>(props);
+        if (m_ellipsoids.count() % m_primitives_per_column != 0)
+            Throw("Ellipsoid count must be divisible by primitives_per_column");
 
         size_t ellipsoids_count_bytes = EllipsoidStructSize * sizeof(float);
         Log(Debug, "Read %i ellipsoids (%s in %s)",
@@ -202,7 +220,7 @@ public:
     void parameters_changed(const std::vector<std::string> &keys) override {
         m_ellipsoids.parameters_changed();
 
-        if (keys.empty() || string::contains(keys, "data")) {
+        if (keys.empty() || string::contains(keys, "data") || string::contains(keys, "extent") || string::contains(keys, "opacities")) {
             recompute_bbox();
             mark_dirty();
         }
@@ -210,14 +228,14 @@ public:
         Base::parameters_changed(keys);
     }
 
-    ScalarSize primitive_count() const override { return (ScalarSize) m_ellipsoids.count(); }
+    ScalarSize primitive_count() const override { return (ScalarSize) (m_ellipsoids.count() / m_primitives_per_column); }
 
     ScalarBoundingBox3f bbox() const override { return m_bbox; }
 
     ScalarBoundingBox3f bbox(ScalarIndex index) const override {
         if constexpr (dr::is_cuda_v<Float>)
             Throw("bbox(ScalarIndex) is not available in CUDA mode!");
-        Assert(index <= primitive_count());
+        Assert(index < primitive_count());
         auto bbox = ((BoundingBoxType*) m_host_bboxes)[index];
 
         return ScalarBoundingBox3f(
@@ -326,7 +344,8 @@ public:
         // intersection point. This additional step makes the whole intersection
         // routine numerically more robust.
 
-        Value plane_t = dot(-o, d) / norm(d);
+        // use the ray parameter rather than its distance in standardized space.
+        Value plane_t = dot(-o, d) / dr::squared_norm(d);
         Value3 plane_p = ray_relative(FloatP(plane_t));
 
         Value A = dr::squared_norm(d);
@@ -403,8 +422,15 @@ public:
         dr::suspend_grad<Float> scope(detach_shape, m_ellipsoids.data());
         SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
 
-        auto ellipsoid = m_ellipsoids.template get_ellipsoid<Float>(pi.prim_index, active);
-        ellipsoid.scale *= m_ellipsoids.template extents<Float>(pi.prim_index, active);
+        // recover the expanded gaussian index reported by grouped cuda hits.
+        UInt32 primitive_index = pi.prim_index;
+        if constexpr (dr::is_cuda_v<Float>) {
+            if (m_primitives_per_column > 1)
+                primitive_index = dr::reinterpret_array<UInt32>(pi.prim_uv[0]);
+        }
+
+        auto ellipsoid = m_ellipsoids.template get_ellipsoid<Float>(primitive_index, active);
+        ellipsoid.scale *= m_ellipsoids.template extents<Float>(primitive_index, active);
         auto rot = dr::quat_to_matrix<Matrix3f>(ellipsoid.quat);
 
         si.t = dr::select(active, pi.t, dr::Infinity<Float>);
@@ -419,7 +445,7 @@ public:
         si.dp_dv = Vector3f(0.f);
         si.dn_du = si.dn_dv = dr::zeros<Vector3f>();
 
-        si.prim_index = pi.prim_index;
+        si.prim_index = primitive_index;
         si.shape      = this;
         si.instance   = nullptr;
 
@@ -427,7 +453,7 @@ public:
     }
 
 #if defined(MI_ENABLE_METAL) || defined(MI_ENABLE_CUDA)
-    // Multi-primitive shape: one AABB + one per-ellipsoid data record.
+    // retain expanded gaussian records while grouping their cuda aabbs.
     void describe(ShapeIR &g) const override {
         Base::describe(g);
 #if defined(MI_ENABLE_METAL)
@@ -460,7 +486,9 @@ public:
                     self->m_ellipsoids.data().data(),
                     it_op != attrs.end() ? it_op.value().data() : nullptr,
                     it_om != attrs.end() ? it_om.value().data() : nullptr,
-                    1u
+                    1u,
+                    self->m_primitives_per_column,
+                    (unsigned int) self->m_ellipsoids.count()
                 };
             };
         }
@@ -527,7 +555,8 @@ public:
         std::ostringstream oss;
         oss << "Ellipsoids[" << std::endl
             << "  bbox = " << string::indent(m_bbox) << "," << std::endl
-            << "  ellipsoid_count = " << primitive_count() << "," << std::endl
+            << "  ellipsoid_count = " << m_ellipsoids.count() << "," << std::endl
+            << "  bvh_primitive_count = " << primitive_count() << "," << std::endl
             << "  " << string::indent(get_children_string()) << std::endl;
 
         if (m_ellipsoids.attributes().size() > 0) {
@@ -587,11 +616,14 @@ public:
 
 private:
     uint32_t m_kernel_type = 0;
+    uint32_t m_primitives_per_column = 1;
 
     /// Helper routine to recompute the bounding boxes of all ellipsoids.
     void recompute_bbox() {
         Timer timer;
         size_t ellipsoid_count = primitive_count();
+        if (m_ellipsoids.count() % m_primitives_per_column != 0)
+            Throw("Ellipsoid count must remain divisible by primitives_per_column");
 
         Log(Debug, "Recomputing bounding boxes for \"%s\" ellipsoids", ellipsoid_count);
 
@@ -608,6 +640,21 @@ private:
             );
 
             BoundingBox3f bbox(ellipsoid.center - delta, ellipsoid.center + delta);
+
+            // union every column's gaussian supports into one conservative box.
+            if (m_primitives_per_column > 1) {
+                UInt32 column_indices = dr::arange<UInt32>(ellipsoid_count);
+                UInt32 first_indices = column_indices * m_primitives_per_column;
+                BoundingBox3f grouped_bbox(dr::gather<Point3f>(bbox.min, first_indices), dr::gather<Point3f>(bbox.max, first_indices));
+
+                for (uint32_t offset = 1; offset < m_primitives_per_column; ++offset) {
+                    UInt32 primitive_indices = first_indices + offset;
+                    grouped_bbox.expand(BoundingBox3f(dr::gather<Point3f>(bbox.min, primitive_indices), dr::gather<Point3f>(bbox.max, primitive_indices)));
+                }
+
+                bbox = grouped_bbox;
+                idx = column_indices;
+            }
 
             uint32_t size = (uint32_t) sizeof(BoundingBoxType) / sizeof(ScalarFloat);
             uint32_t stride = (uint32_t) offsetof(BoundingBoxType, max) / sizeof(ScalarFloat);

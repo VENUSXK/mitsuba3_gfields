@@ -22,6 +22,9 @@ struct OptixEllipsoidsData {
     float* omegas;
     /// Triangles per shell instance (EllipsoidsMesh); 1 for analytic shells.
     unsigned int subprimitive_count;
+    // group consecutive gaussian supports under one acceleration primitive.
+    unsigned int primitives_per_column = 1;
+    unsigned int primitive_count = 0;
 
 #ifdef __CUDACC__
     DEVICE Vector3f center(unsigned int index) const {
@@ -48,81 +51,53 @@ struct OptixEllipsoidsData {
 };
 
 #ifdef __CUDACC__
-extern "C" __global__ void __intersection__ellipsoids() {
-    const OptixHitGroupData *sbt_data = (OptixHitGroupData*) optixGetSbtDataPointer();
-    OptixEllipsoidsData &ellipsoid = *((OptixEllipsoidsData *) sbt_data->data);
-
-    unsigned int prim_index = optixGetPrimitiveIndex();
-    Vector3f center   = ellipsoid.center(prim_index);
-    Vector3f scale    = ellipsoid.scale(prim_index);
+// reuse the same support test for grouped traversal and per-gaussian hits.
+DEVICE bool ellipsoid_support_hit(const OptixEllipsoidsData &ellipsoid, unsigned int prim_index,
+                                  const Ray3f &ray, bool include_interior, float &t, unsigned int &hit_kind) {
+    Vector3f center = ellipsoid.center(prim_index);
+    Vector3f scale = ellipsoid.scale(prim_index) * ellipsoid.extents[prim_index];
     Matrix3f rotation = ellipsoid.rotation(prim_index);
-    scale *= ellipsoid.extents[prim_index];
+    Vector3f o = rotation.transposed_prod(ray.o - center) / scale;
+    Vector3f d = rotation.transposed_prod(ray.d) / scale;
 
-    // Ray in instance-space
-    Ray3f ray = get_ray();
-    Vector3f o = rotation.transposed_prod(ray.o - center);
-    Vector3f d = rotation.transposed_prod(ray.d);
-    o /= scale;
-    d /= scale;
-    Ray3f ray_relative(o, d, ray.maxt, ray.time);
-
-    // We define a plane which is perpendicular to the ray direction and
-    // contains the ellipsoid center and intersect it. We then solve the
-    // ray-ellipsoid intersection as if the ray origin was this new
-    // intersection point. This additional step makes the whole intersection
-    // routine numerically more robust.
-
-    float plane_t = dot(-o, d) / norm(d);
-    Vector3f plane_p = ray_relative(plane_t);
-
-    // Ray is perpendicular to the origin-center segment,
-    // and intersection with plane is outside of the sphere
-    if (plane_t == 0.f && norm(plane_p) > 1.f)
-        return;
-
-    float A = squared_norm(d);
-    float B = 2.f * dot(plane_p, d);
-    float C = squared_norm(plane_p) - 1.f;
-
+    // project onto the closest plane without magnifying small-scale rays.
+    float plane_t = dot(-o, d) / squared_norm(d);
+    Vector3f plane_p = o + d * plane_t;
     float near_t, far_t;
-    bool solution_found = solve_quadratic(A, B, C, near_t, far_t);
-
-    // Adjust distances for plane intersection
+    bool solution_found = solve_quadratic(squared_norm(d), 2.f * dot(plane_p, d), squared_norm(plane_p) - 1.f, near_t, far_t);
     near_t += plane_t;
     far_t += plane_t;
 
-    // Ellipsoid doesn't intersect with the segment on the ray
-    bool out_bounds = !(near_t <= ray.maxt && far_t >= 0.f); // NaN-aware conditionals
-
-    // Ellipsoid fully contains the segment of the ray
-    bool in_bounds = near_t < 0.f && far_t > ray.maxt;
-
-    // Ellipsoid is backfacing
-    bool backfacing = near_t < 0.f;
-
-    // Interior-hit reporting for the CollectEllipsoids any-hit queries
-    // (Scene::ray_collect_ellipsoids): primitives whose shell contains the
-    // ray origin report their forward exit so the any-hit program can run
-    // its containment test. Gated on OPTIX_RAY_FLAG_ENFORCE_ANYHIT, which
-    // no ordinary ray_intersect/ray_test trace sets, so regular traversal
-    // keeps the entry-only convention. The reported distance is clamped
-    // into the valid range; its value is irrelevant (the hit is ignored).
-    if (optixGetRayFlags() & OPTIX_RAY_FLAG_ENFORCE_ANYHIT) {
-        if (solution_found && backfacing && far_t >= 0.f) {
-            float t_report = fminf(far_t, ray.maxt * (1.f - 1e-6f));
-            optixReportIntersection(fmaxf(t_report, 0.f),
-                                    OPTIX_HIT_KIND_TRIANGLE_BACK_FACE);
-        }
-        // Entries of non-containing primitives fall through to the normal
-        // path below (the any-hit containment test rejects them).
+    // expose containing supports only to coverage and sampling queries.
+    if (include_interior && solution_found && near_t < 0.f && far_t >= 0.f) {
+        t = fmaxf(fminf(far_t, ray.maxt * (1.f - 1e-6f)), 0.f);
+        hit_kind = OPTIX_HIT_KIND_TRIANGLE_BACK_FACE;
+        return true;
     }
+    t = near_t;
+    hit_kind = OPTIX_HIT_KIND_TRIANGLE_FRONT_FACE;
+    return solution_found && near_t >= 0.f && near_t <= ray.maxt && far_t >= 0.f;
+}
 
-    bool active = solution_found && !out_bounds && !in_bounds && !backfacing;
+extern "C" __global__ void __intersection__ellipsoids() {
+    const OptixHitGroupData *sbt_data = (OptixHitGroupData *) optixGetSbtDataPointer();
+    const OptixEllipsoidsData &ellipsoid = *((const OptixEllipsoidsData *) sbt_data->data);
+    Ray3f ray = get_ray();
+    unsigned int count = ellipsoid.primitives_per_column;
+    unsigned int first = optixGetPrimitiveIndex() * count;
+    bool include_interior = (optixGetRayFlags() & OPTIX_RAY_FLAG_ENFORCE_ANYHIT) != 0;
+    bool grouped_anyhit = count > 1 && !(optixGetRayFlags() & OPTIX_RAY_FLAG_DISABLE_ANYHIT);
 
-    float t = (near_t < 0.f ? far_t: near_t);
-
-    if (active) {
-        optixReportIntersection(t, OPTIX_HIT_KIND_TRIANGLE_FRONT_FACE);
+    // report one group event for any-hit and individual ids for closest-hit.
+    for (unsigned int k = 0; k < count; ++k) {
+        unsigned int prim_index = first + k;
+        float t;
+        unsigned int hit_kind;
+        if (ellipsoid_support_hit(ellipsoid, prim_index, ray, include_interior, t, hit_kind)) {
+            optixReportIntersection(t, hit_kind, prim_index, __float_as_uint(ray.maxt));
+            if (grouped_anyhit)
+                return;
+        }
     }
 }
 
@@ -200,7 +175,7 @@ DEVICE float ellipsoid_fullline_optical_depth(const OptixEllipsoidsData &e,
  * inside a shell miss that primitive, mirroring the walk-based integrators;
  * callers handle vertex-enclosing primitives analytically.
  */
-DEVICE void transmittance_anyhit_ellipsoids(void* data,
+DEVICE bool transmittance_anyhit_ellipsoids(void* data,
                                             unsigned int prim_index,
                                             unsigned int mi_ray_flags) {
     const OptixEllipsoidsData &e = *((const OptixEllipsoidsData *) data);
@@ -214,8 +189,7 @@ DEVICE void transmittance_anyhit_ellipsoids(void* data,
     if (mi_ray_flags & MiTransmittanceEllipsoids) {
         float acc = __uint_as_float(optixGetPayload_2());
         optixSetPayload_2(__float_as_uint(acc + tau));
-        optixIgnoreIntersection();
-        return;
+        return false;
     }
 
     // Stochastic Bernoulli test. Net-amplifying signed primitives (tau < 0)
@@ -224,9 +198,8 @@ DEVICE void transmittance_anyhit_ellipsoids(void* data,
     float p_survive = expf(-fmaxf(tau, 0.f));
     unsigned int seed = optixGetPayload_1();
     float u = pcg_uniform(seed ^ (prim_index * 0x9E3779B9u));
-    if (u < p_survive)
-        optixIgnoreIntersection();
-    // else: accept -> the ray terminates as absorbed
+    // let the outer handler ignore once after every child has contributed.
+    return u >= p_survive;
 }
 
 /**
@@ -264,7 +237,7 @@ DEVICE void transmittance_anyhit_ellipsoids(void* data,
  * duplicate is skipped early as an optimization).
  */
 DEVICE void sample_anyhit_ellipsoids(const OptixHitGroupData *sbt_data,
-                                     unsigned int prim_index) {
+                                     unsigned int prim_index, bool backfacing) {
     const OptixEllipsoidsData &e = *((const OptixEllipsoidsData *) sbt_data->data);
     if (e.subprimitive_count > 1)
         prim_index /= e.subprimitive_count;
@@ -291,12 +264,11 @@ DEVICE void sample_anyhit_ellipsoids(const OptixHitGroupData *sbt_data,
     // otherwise it duplicates the front-face one -- skip before the
     // transcendentals. The shell roots are used for nothing else: flights
     // integrate the kernel's full unbounded support.
-    if (optixIsBackFaceHit()) {
+    if (backfacing) {
         float ext  = e.extents[prim_index];
         float disc = B * B - C + ext * ext;
         float t_near = -B - sqrtf(fmaxf(disc, 0.f));
         if (!(t_near < 0.f)) {
-            optixIgnoreIntersection();
             return;
         }
     }
@@ -312,7 +284,6 @@ DEVICE void sample_anyhit_ellipsoids(const OptixHitGroupData *sbt_data,
     float A = opacity * J * expf(-0.5f * (C - B * B))
                       / (TwoPi * scale.x() * scale.y() * scale.z());
     if (!(A > 0.f) || !isfinite(A)) {
-        optixIgnoreIntersection();
         return;
     }
 
@@ -323,7 +294,6 @@ DEVICE void sample_anyhit_ellipsoids(const OptixHitGroupData *sbt_data,
     const float SqrtHalf = 0.7071067811865476f;
     float arg = erff(SqrtHalf * (t0 + B)) + 2.f * chi / A;
     if (!(arg < 1.f)) { // remaining envelope mass exhausted
-        optixIgnoreIntersection();
         return;
     }
     float th = sqrtf(2.f) * erfinvf(arg) - B;
@@ -334,7 +304,6 @@ DEVICE void sample_anyhit_ellipsoids(const OptixHitGroupData *sbt_data,
         optixSetPayload_3(sbt_data->shape_registry_id);
         optixSetPayload_4(prim_index);
     }
-    optixIgnoreIntersection();
 }
 
 /**
@@ -385,6 +354,5 @@ DEVICE void collect_anyhit_ellipsoids(const OptixHitGroupData *sbt_data,
             optixSetPayload_1(count + 1);
         }
     }
-    optixIgnoreIntersection();
 }
 #endif
