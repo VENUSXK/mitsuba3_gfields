@@ -187,7 +187,7 @@ public:
             int mask = props.get<int>("visibility_mask");
             if (mask < 0 || mask > 255)
                 Throw("visibility_mask must be in [0, 255], got %i", mask);
-            m_visibility_mask = (uint32_t) mask;
+            this->m_visibility_mask = (uint32_t) mask;
         }
 
         Timer timer;

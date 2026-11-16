@@ -43,6 +43,16 @@ static void register_typed_plugin(std::string_view name, nb::handle constructor,
 };
 
 
+// resolve array storage in a template so scalar variants discard jit-only code.
+template <typename Array>
+static uintptr_t array_device_address(const Array &array) {
+    if constexpr (dr::is_jit_v<Array>)
+        return (uintptr_t) array.data();
+    else
+        return (uintptr_t) &array;
+}
+
+
 MI_PY_EXPORT(Scene) {
     MI_PY_IMPORT_TYPES(Scene, Integrator, SamplingIntegrator, MonteCarloIntegrator, Sensor)
     auto scene = MI_PY_CLASS(Scene, Object, nb::is_final())
@@ -201,12 +211,7 @@ MI_PY_EXPORT(Scene) {
     dr::bind_traverse(scene);
 
     m.def("device_address",
-          [](const UInt32 &array) -> uintptr_t {
-              if constexpr (dr::is_jit_v<UInt32>)
-                  return (uintptr_t) array.data();
-              else
-                  return (uintptr_t) &array;
-          },
+          &array_device_address<UInt32>,
           "array"_a,
           "Device address of an *evaluated* JIT array. Used to hand "
           "caller-allocated buffers to the any-hit collect queries; must "
