@@ -46,6 +46,7 @@ struct MiOptixSceneState {
     /// follow the host scene's. Set once in init().
     uint32_t sbt_record_base = 0;
     bool compact_accel = false;
+    bool has_column_mesh = false;
     uint32_t sbt_jit_index;
 
     /// Copies of MiOptixConfig fields, cached to avoid a hash lookup + mutex lock.
@@ -374,6 +375,10 @@ static void optix_rebuild_accel(
         const SceneIR &sd) {
     using UInt64 = dr::uint64_array_t<Float>;
     MiOptixSceneState &s = *state;
+    s.has_column_mesh = false;
+    for (const auto &blas : sd.blases)
+        for (const auto &geometry : blas.geoms)
+            s.has_column_mesh |= geometry.column_mesh;
 
     if (!scene->shapes().empty()) {
         scoped_optix_context guard;
@@ -702,6 +707,28 @@ void OptixAccel<Float, Spectrum>::static_shutdown() {
 //  OptixAccel<Float, Spectrum> -- ray queries
 // -----------------------------------------------------------------------
 
+// visit complete closed proxies while preserving the caller's payload accumulators.
+template <typename UInt32>
+static UInt32 trace_column_mesh_pass(MiOptixSceneState &s, uint32_t *args, size_t count, uint32_t active_index, uint32_t mode = 0) {
+    using Single = dr::float32_array_t<UInt32>;
+    UInt32 previous[6];
+    for (size_t i = 15; i < count; ++i) {
+        previous[i - 15] = UInt32::steal(args[i]);
+        args[i] = previous[i - 15].index();
+    }
+    UInt32 flags = previous[0] | (MiColumnMeshPass | mode);
+    bool stochastic = (mode & (uint32_t) +RayFlags::StochasticEllipsoids) != 0;
+    UInt32 ray_flags(OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT | OPTIX_RAY_FLAG_ENFORCE_ANYHIT | (stochastic ? OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT : 0));
+    Single unlimited(dr::Infinity<Single>);
+    args[8] = unlimited.index();
+    args[11] = ray_flags.index();
+    args[15] = flags.index();
+    OptixHitObjectField field = OptixHitObjectField::IsHit;
+    uint32_t result;
+    jit_optix_ray_trace((uint32_t) count, args, 1, &field, &result, false, 0, 0, true, active_index, s.pipeline_jit_index, s.sbt_jit_index);
+    return UInt32::steal(result);
+}
+
 template <typename Float, typename Spectrum>
 typename OptixAccel<Float, Spectrum>::PreliminaryIntersection3f
 OptixAccel<Float, Spectrum>::ray_intersect_preliminary(
@@ -719,6 +746,8 @@ OptixAccel<Float, Spectrum>::ray_intersect_preliminary(
     // instances.
     ray_flags |= OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
 
+    if (s.has_column_mesh)
+        ray_flags &= ~UInt32(OPTIX_RAY_FLAG_DISABLE_ANYHIT);
     bool has_instances = !scene->m_shapegroups.empty();
 
     using Single = dr::float32_array_t<Float>;
@@ -729,6 +758,10 @@ OptixAccel<Float, Spectrum>::ray_intersect_preliminary(
     if constexpr (!std::is_same_v<Single, Float>)
         ray_maxt = dr::minimum(ray_maxt, dr::Largest<Single>);
 
+    // ordinary geometry retains its normal closest hit while proxies are ignored.
+    UInt32 p_flags(0u), p_limit(dr::reinterpret_array<UInt32, Single>(ray_maxt)),
+           p_best(dr::reinterpret_array<UInt32, Single>(Single(dr::Infinity<Single>))),
+           p_shape(0xffffffffu), p_primitive(0u), p_instance(0u);
     uint32_t trace_args[] {
         accel_handle.index(),
         ray_o.x().index(), ray_o.y().index(), ray_o.z().index(),
@@ -737,6 +770,7 @@ OptixAccel<Float, Spectrum>::ray_intersect_preliminary(
         ray_mask.index(), ray_flags.index(),
         sbt_offset.index(), sbt_stride.index(),
         miss_sbt_index.index(),
+        p_flags.index(), p_limit.index(), p_best.index(), p_shape.index(), p_primitive.index(), p_instance.index(),
     };
     OptixHitObjectField fields[] {
         OptixHitObjectField::IsHit,
@@ -755,16 +789,16 @@ OptixAccel<Float, Spectrum>::ray_intersect_preliminary(
     jit_optix_ray_trace(sizeof(trace_args) / sizeof(uint32_t), trace_args,
                         has_instances ? 7 : 6, fields, hitobject_out,
                         reorder, reorder_hint.index(), reorder_hint_bits,
-                        false, active.index(),
+                        s.has_column_mesh, active.index(),
                         s.pipeline_jit_index, s.sbt_jit_index);
 
     Mask valid = UInt32::steal(hitobject_out[0]) != 0;
-    active &= valid;
+    Mask hit_active = active & valid;
 
     // Get shape registry ID from SBT data (first 32 bits of `OptixHitGroupData`)
     UInt64 hitobject_sbt_ptr = UInt64::steal(hitobject_out[5]);
     uint32_t shape_id_idx = jit_optix_sbt_data_load(
-        hitobject_sbt_ptr.index(), VarType::UInt32, 0, active.index());
+        hitobject_sbt_ptr.index(), VarType::UInt32, 0, hit_active.index());
 
     PreliminaryIntersection3f pi;
     pi.valid      = valid;
@@ -778,15 +812,35 @@ OptixAccel<Float, Spectrum>::ray_intersect_preliminary(
     // This field is only used by embree, but we still need to initialize it for vcalls
     pi.shape_index = dr::zeros<UInt32>();
 
+    // merge exact child hits with ordinary surfaces, including overlapping columns.
+    if (s.has_column_mesh) {
+        auto ignored = trace_column_mesh_pass<UInt32>(s, trace_args, sizeof(trace_args) / sizeof(uint32_t), active.index(), MiColumnMeshClosest);
+        Float child_t = dr::reinterpret_array<Single, UInt32>(UInt32::steal(trace_args[17]));
+        UInt32 child_shape = UInt32::steal(trace_args[18]);
+        UInt32 child_id = UInt32::steal(trace_args[19]);
+        UInt32 child_instance = UInt32::steal(trace_args[20]);
+        UInt32::steal(trace_args[15]);
+        UInt32::steal(trace_args[16]);
+        Mask nearer = active & (child_shape != 0xffffffffu) & (!pi.valid | (child_t < pi.t));
+        pi.t = dr::select(nearer, child_t, pi.t);
+        pi.prim_index = dr::select(nearer, child_id, pi.prim_index);
+        pi.prim_uv = dr::select(nearer, Point2f(0.f), pi.prim_uv);
+        pi.shape = dr::select(nearer, dr::reinterpret_array<ShapePtr>(child_shape), pi.shape);
+        pi.instance = dr::select(nearer, dr::reinterpret_array<ShapePtr>(child_instance), pi.instance);
+        pi.valid |= nearer;
+    }
     return pi;
 }
 
 template <typename Float, typename Spectrum>
 typename OptixAccel<Float, Spectrum>::Mask
-OptixAccel<Float, Spectrum>::ray_test(const Scene<Float, Spectrum> * /*scene*/,
+OptixAccel<Float, Spectrum>::ray_test(const Scene<Float, Spectrum> *scene,
                                       const Ray3f &ray, Mask /*coherent*/,
                                       Mask active) const {
     MiOptixSceneState &s = *state;
+    if (s.has_column_mesh)
+        return ray_intersect_preliminary(scene, ray, false, false, 0u, 0u, active).is_valid();
+
 
     UInt32 ray_mask(ray.mask),
            ray_flags(OPTIX_RAY_FLAG_DISABLE_ANYHIT |
@@ -854,7 +908,7 @@ Float OptixAccel<Float, Spectrum>::ray_transmittance_ellipsoids(
         ray_maxt = dr::minimum(ray_maxt, dr::Largest<Single>);
 
     // Payloads: mi flags, per-ray RNG seed, optical-depth accumulator.
-    UInt32 p_flags(mode_flags), p_seed(seed), p_tau(0u);
+    UInt32 p_flags(mode_flags), p_seed(seed), p_tau(0u), p_limit(dr::reinterpret_array<UInt32, Single>(ray_maxt));
 
     uint32_t trace_args[] {
         accel_handle.index(),
@@ -864,7 +918,7 @@ Float OptixAccel<Float, Spectrum>::ray_transmittance_ellipsoids(
         ray_mask.index(), ray_flags.index(),
         sbt_offset.index(), sbt_stride.index(),
         miss_sbt_index.index(),
-        p_flags.index(), p_seed.index(), p_tau.index(),
+        p_flags.index(), p_seed.index(), p_tau.index(), p_limit.index(),
     };
 
     OptixHitObjectField field = OptixHitObjectField::IsHit;
@@ -875,13 +929,19 @@ Float OptixAccel<Float, Spectrum>::ray_transmittance_ellipsoids(
                         false, 0, 0, /* invoke = */ true, active.index(),
                         s.pipeline_jit_index, s.sbt_jit_index);
 
+    // trace complete column boxes separately so finite segments inside a proxy work.
+    UInt32 column_hit(0u);
+    if (s.has_column_mesh)
+        column_hit = trace_column_mesh_pass<UInt32>(s, trace_args, sizeof(trace_args) / sizeof(uint32_t), active.index(), mode_flags);
+    UInt32::steal(trace_args[18]);
+
     // The payload argument slots were rewritten with the final payload values.
     UInt32 out_flags = UInt32::steal(trace_args[15]);
     UInt32 out_seed  = UInt32::steal(trace_args[16]);
     UInt32 out_tau   = UInt32::steal(trace_args[17]);
     (void) out_flags; (void) out_seed;
 
-    Mask hit = UInt32::steal(hitobject_out) != 0;
+    Mask hit = (UInt32::steal(hitobject_out) | column_hit) != 0;
 
     Float result;
     if (stochastic) {
@@ -968,6 +1028,11 @@ OptixAccel<Float, Spectrum>::ray_sample_ellipsoids(
                         has_instances ? 7 : 6, fields, hitobject_out,
                         false, 0, 0, /* invoke = */ true, active.index(),
                         s.pipeline_jit_index, s.sbt_jit_index);
+
+    // proxy exits are discovered independently of opaque blockers and segment ends.
+    if (s.has_column_mesh) {
+        auto ignored = trace_column_mesh_pass<UInt32>(s, trace_args, sizeof(trace_args) / sizeof(uint32_t), active.index());
+    }
 
     // Payload slots were rewritten with the final values.
     Single t_min = dr::reinterpret_array<Single, UInt32>(
@@ -1056,6 +1121,11 @@ OptixAccel<Float, Spectrum>::ray_collect_ellipsoids(
                         1, &field, &hitobject_out,
                         false, 0, 0, /* invoke = */ true, active.index(),
                         s.pipeline_jit_index, s.sbt_jit_index);
+
+    // containing boxes must remain discoverable even when maxt ends inside them.
+    if (s.has_column_mesh) {
+        auto ignored = trace_column_mesh_pass<UInt32>(s, trace_args, sizeof(trace_args) / sizeof(uint32_t), active.index());
+    }
 
     UInt32 count = UInt32::steal(trace_args[16]);
     UInt32::steal(trace_args[15]);

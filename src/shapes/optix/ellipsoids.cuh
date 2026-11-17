@@ -25,6 +25,7 @@ struct OptixEllipsoidsData {
     // group consecutive gaussian supports under one acceleration primitive.
     unsigned int primitives_per_column = 1;
     unsigned int primitive_count = 0;
+    bool column_mesh = false;
 
 #ifdef __CUDACC__
     DEVICE Vector3f center(unsigned int index) const {
@@ -125,7 +126,7 @@ DEVICE float pcg_uniform(unsigned int v) {
  * Jacobian). Pure Gaussians are the omega = 0 special case (cos -> 1).
  */
 DEVICE float ellipsoid_fullline_optical_depth(const OptixEllipsoidsData &e,
-                                              unsigned int prim_index) {
+                                              unsigned int prim_index, bool resolved_index = false) {
     Vector3f center   = e.center(prim_index);
     Vector3f scale    = e.scale(prim_index);
     Matrix3f rotation = e.rotation(prim_index);
@@ -177,11 +178,11 @@ DEVICE float ellipsoid_fullline_optical_depth(const OptixEllipsoidsData &e,
  */
 DEVICE bool transmittance_anyhit_ellipsoids(void* data,
                                             unsigned int prim_index,
-                                            unsigned int mi_ray_flags) {
+                                            unsigned int mi_ray_flags, bool resolved_index = false) {
     const OptixEllipsoidsData &e = *((const OptixEllipsoidsData *) data);
 
     // EllipsoidsMesh reports triangle indices; map to the shell instance.
-    if (e.subprimitive_count > 1)
+    if (!resolved_index && e.subprimitive_count > 1)
         prim_index /= e.subprimitive_count;
 
     float tau = ellipsoid_fullline_optical_depth(e, prim_index);
@@ -237,9 +238,9 @@ DEVICE bool transmittance_anyhit_ellipsoids(void* data,
  * duplicate is skipped early as an optimization).
  */
 DEVICE void sample_anyhit_ellipsoids(const OptixHitGroupData *sbt_data,
-                                     unsigned int prim_index, bool backfacing) {
+                                     unsigned int prim_index, bool backfacing, bool resolved_index = false) {
     const OptixEllipsoidsData &e = *((const OptixEllipsoidsData *) sbt_data->data);
-    if (e.subprimitive_count > 1)
+    if (!resolved_index && e.subprimitive_count > 1)
         prim_index /= e.subprimitive_count;
 
     Vector3f center   = e.center(prim_index);
@@ -326,9 +327,9 @@ DEVICE void sample_anyhit_ellipsoids(const OptixHitGroupData *sbt_data,
  * Each entry is an (shape_registry_id, prim_index) pair of unsigned ints.
  */
 DEVICE void collect_anyhit_ellipsoids(const OptixHitGroupData *sbt_data,
-                                      unsigned int prim_index) {
+                                      unsigned int prim_index, bool resolved_index = false) {
     const OptixEllipsoidsData &e = *((const OptixEllipsoidsData *) sbt_data->data);
-    if (e.subprimitive_count > 1)
+    if (!resolved_index && e.subprimitive_count > 1)
         prim_index /= e.subprimitive_count;
 
     Vector3f center   = e.center(prim_index);

@@ -13,6 +13,10 @@
 #include <mitsuba/render/optix/bbox.cuh>
 #include <mitsuba/render/optix/matrix.cuh>
 
+// internal query bits shared by the host and cuda column-shell paths.
+constexpr uint32_t MiColumnMeshPass = 0x10000;
+constexpr uint32_t MiColumnMeshClosest = 0x20000;
+
 /// Stores information about a Shape on the Optix side
 struct OptixHitGroupData {
     /// Shape id in Dr.Jit's pointer registry

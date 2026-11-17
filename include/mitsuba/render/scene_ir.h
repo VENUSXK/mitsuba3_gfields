@@ -23,6 +23,8 @@ struct ShapeIR {
         Instance          ///< ShapeGroup instance, carries no geometry and is never bucketed
     };
 
+    // mark column shells so optix can preserve child-level query semantics.
+    bool column_mesh = false;
     Kind kind = Kind::Custom;
     ShapeType type{};
 

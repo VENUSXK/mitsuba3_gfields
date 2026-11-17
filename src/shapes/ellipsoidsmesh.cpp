@@ -161,7 +161,17 @@ public:
 
         Timer timer;
 
+        // explicit group sizes select one conservative box shell per column.
+        m_column_mesh = props.has_property("primitives_per_column");
+        int64_t group_size = props.get<int64_t>("primitives_per_column", 1);
+        if (group_size < 1 || group_size > UINT32_MAX)
+            Throw("primitives_per_column must be positive and divide the primitive count");
+        m_primitives_per_column = (uint32_t) group_size;
+        if (m_column_mesh && !dr::is_cuda_v<Float>)
+            Throw("Column mesh shells currently require the CUDA backend");
         m_ellipsoids = EllipsoidsData<Float, Spectrum>(props);
+        if (m_ellipsoids.count() % m_primitives_per_column != 0)
+            Throw("Primitive count must be divisible by primitives_per_column");
 
         std::string_view shell_type = "default";
         if (props.has_property("shell")) {
@@ -174,6 +184,9 @@ public:
             }
         }
 
+        // consume shell properties but use a closed box for grouped supports.
+        if (m_column_mesh)
+            shell_type = "box";
         if (shell_type == "box") {
             Log(Debug, "Load box shell template (12 triangles)");
             m_shell_vertices = box_vertices;
@@ -233,8 +246,8 @@ public:
             }
         }
 
-        // Scale vertex positions of shell to ensure that it full encapsulates the unit sphere
-        {
+        // scale ordinary shells; the box template already encloses its bounds.
+        if (!m_column_mesh) {
             InputFloat scaling = dr::Largest<InputFloat>;
             for (size_t i = 0; i < m_shell_faces.size(); ++i) {
                 InputPoint3f v0 = m_shell_vertices[m_shell_faces[i][0]];
@@ -272,7 +285,7 @@ public:
     void parameters_changed(const std::vector<std::string> &keys) override {
         m_ellipsoids.parameters_changed();
 
-        if (keys.empty() || string::contains(keys, "data")) {
+        if (keys.empty() || string::contains(keys, "data") || (m_column_mesh && (string::contains(keys, "extent") || string::contains(keys, "opacities")))) {
             recompute_mesh();
         }
 
@@ -324,6 +337,23 @@ public:
                                                      uint32_t ray_flags,
                                                      uint32_t recursion_depth,
                                                      Mask active) const override {
+        // construct the same analytic child interaction used by grouped ellipsoids.
+        if (m_column_mesh) {
+            dr::suspend_grad<Float> scope(has_flag(ray_flags, RayFlags::DetachShape), m_ellipsoids.data());
+            auto ellipsoid = m_ellipsoids.template get_ellipsoid<Float>(pi.prim_index, active);
+            ellipsoid.scale *= m_ellipsoids.template extents<Float>(pi.prim_index, active);
+            auto rotation = dr::quat_to_matrix<Matrix3f>(ellipsoid.quat);
+            auto si = dr::zeros<SurfaceInteraction3f>();
+            si.t = dr::select(active, pi.t, dr::Infinity<Float>);
+            si.p = ray(pi.t);
+            Point3f local = dr::transpose(rotation) * (si.p - ellipsoid.center);
+            si.sh_frame.n = dr::normalize(rotation * (local / dr::square(ellipsoid.scale)));
+            si.n = si.sh_frame.n;
+            si.prim_index = pi.prim_index;
+            si.shape = this;
+            return si;
+        }
+
         auto si = Base::compute_surface_interaction(ray, pi, ray_flags, recursion_depth, active);
 
         // Divide by the number of faces per Gaussians
@@ -403,26 +433,45 @@ public:
 
 private:
     uint32_t m_kernel_type = 0;
+    uint32_t m_primitives_per_column = 1;
+    bool m_column_mesh = false;
 
     void recompute_mesh() {
         if constexpr (dr::is_jit_v<Float>) {
-            UInt32 idx = dr::arange<UInt32>(m_ellipsoids.count());
+            size_t shell_count = m_column_mesh ? m_ellipsoids.count() / m_primitives_per_column : m_ellipsoids.count();
+            UInt32 idx = dr::arange<UInt32>(shell_count);
 
             auto ellipsoid = m_ellipsoids.template get_ellipsoid<Float>(idx);
             auto rot = dr::quat_to_matrix<Matrix3f>(ellipsoid.quat);
 
-            const AffineTransform4f& to_world = AffineTransform4f::translate(ellipsoid.center) *
+            AffineTransform4f to_world = AffineTransform4f::translate(ellipsoid.center) *
                                           AffineTransform4f(rot) *
                                           AffineTransform4f::scale(ellipsoid.scale) *
                                           AffineTransform4f::scale(m_ellipsoids.template extents<Float>(idx));
 
+            // union every child support and map the unit box onto that bound.
+            if (m_column_mesh) {
+                UInt32 first = idx * m_primitives_per_column;
+                Point3f lower(dr::Infinity<Float>), upper(-dr::Infinity<Float>);
+                for (uint32_t k = 0; k < m_primitives_per_column; ++k) {
+                    auto child = m_ellipsoids.template get_ellipsoid<Float>(first + k);
+                    auto scale = child.scale * m_ellipsoids.template extents<Float>(first + k);
+                    auto rotation = dr::quat_to_matrix<Matrix3f>(child.quat);
+                    Vector3f delta(dr::norm(rotation[0] * scale), dr::norm(rotation[1] * scale), dr::norm(rotation[2] * scale));
+                    lower = dr::minimum(lower, child.center - delta);
+                    upper = dr::maximum(upper, child.center + delta);
+                }
+                // pad rounding at support boundaries without changing child geometry.
+                Vector3f radius = (upper - lower) * 0.5f;
+                radius += dr::maximum(dr::abs((upper + lower) * 0.5f), Vector3f(1.f)) * 1e-6f;
+                to_world = AffineTransform4f::translate((upper + lower) * 0.5f) * AffineTransform4f::scale(radius);
+            }
+
             int nb_vertices = (int) m_shell_vertices.size();
             int nb_faces    = (int) m_shell_faces.size();
 
-            uint32_t vertex_count = (uint32_t) (m_ellipsoids.count() * nb_vertices);
-            uint32_t face_count   = (uint32_t) (m_ellipsoids.count() * nb_faces);
-
-            bool initialized = (vertex_count != m_vertex_count) || (face_count != m_face_count);
+            uint32_t vertex_count = (uint32_t) (shell_count * nb_vertices);
+            uint32_t face_count   = (uint32_t) (shell_count * nb_faces);
 
             m_vertex_count = vertex_count;
             m_face_count   = face_count;
@@ -449,8 +498,7 @@ private:
             m_vertex_positions_ptr = m_vertex_positions.data();
             m_faces_ptr = m_faces.data();
 #endif
-            if (initialized)
-                recompute_bbox();
+            recompute_bbox();
             mark_dirty();
         } else {
             size_t nb_vertices = m_shell_vertices.size();
@@ -508,6 +556,7 @@ private:
         // Mesh::describe() tags this as plain Triangles. Refine it to the
         // back-face-culled bucket (the only kind both GPU backends cull).
         g.kind = ShapeIR::Kind::TrianglesCulled;
+        g.column_mesh = m_column_mesh;
 
 #if defined(MI_ENABLE_CUDA)
         if constexpr (dr::is_cuda_v<Float>) {
@@ -526,7 +575,8 @@ private:
                     self->m_ellipsoids.data().data(),
                     it_op != attrs.end() ? it_op.value().data() : nullptr,
                     it_om != attrs.end() ? it_om.value().data() : nullptr,
-                    (unsigned int) self->m_shell_faces.size()
+                    (unsigned int) self->m_shell_faces.size(),
+                    self->m_primitives_per_column, (unsigned int) self->m_ellipsoids.count(), self->m_column_mesh
                 };
             };
         }

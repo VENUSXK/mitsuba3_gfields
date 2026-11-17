@@ -48,6 +48,63 @@ extern "C" __global__ void __anyhit__transmittance() {
         shape_type == (unsigned int) ShapeType::EllipsoidsMesh ||
         shape_type == (unsigned int) ShapeType::Ellipsoids;
 
+    // ordinary traces ignore proxies; the dedicated pass visits complete shells.
+    const OptixEllipsoidsData *ellipsoids = is_ellipsoids ? (const OptixEllipsoidsData *) sbt_data->data : nullptr;
+    bool column_mesh = ellipsoids && shape_type == (unsigned int) ShapeType::EllipsoidsMesh && ellipsoids->column_mesh;
+    bool column_pass = (mi_ray_flags & MiColumnMeshPass) != 0;
+    if (column_pass && !column_mesh) {
+        optixIgnoreIntersection();
+        return;
+    }
+    if (column_mesh && !column_pass) {
+        optixIgnoreIntersection();
+        return;
+    }
+    if (!mi_ray_flags)
+        return;
+
+    // use only the exit face of each closed box so containing shells fire once.
+    if (column_mesh) {
+        if (!optixIsBackFaceHit()) {
+            optixIgnoreIntersection();
+            return;
+        }
+        const auto &e = *ellipsoids;
+        unsigned int first = (prim_index / e.subprimitive_count) * e.primitives_per_column;
+        Ray3f ray = get_ray();
+        bool closest = (mi_ray_flags & MiColumnMeshClosest) != 0;
+        if (closest)
+            ray.maxt = __uint_as_float(optixGetPayload_1());
+        else if (!(mi_ray_flags & (MiSampleEllipsoids | MiCollectEllipsoids)))
+            ray.maxt = __uint_as_float(optixGetPayload_3());
+
+        // resolve exact child ids before sharing the existing integration helpers.
+        for (unsigned int k = 0; k < e.primitives_per_column; ++k) {
+            unsigned int child = first + k, kind;
+            float t;
+            bool interior = !closest && (mi_ray_flags & (MiSampleEllipsoids | MiCollectEllipsoids));
+            if (!ellipsoid_support_hit(e, child, ray, interior, t, kind))
+                continue;
+            if (closest) {
+                float best = __uint_as_float(optixGetPayload_2());
+                unsigned int best_shape = optixGetPayload_3(), best_child = optixGetPayload_4();
+                if (t < best || (t == best && (sbt_data->shape_registry_id < best_shape || (sbt_data->shape_registry_id == best_shape && child < best_child)))) {
+                    optixSetPayload_2(__float_as_uint(t));
+                    optixSetPayload_3(sbt_data->shape_registry_id);
+                    optixSetPayload_4(child);
+                    optixSetPayload_5(optixGetInstanceId());
+                }
+            } else if (mi_ray_flags & MiSampleEllipsoids)
+                sample_anyhit_ellipsoids(sbt_data, child, kind == OPTIX_HIT_KIND_TRIANGLE_BACK_FACE, true);
+            else if (mi_ray_flags & MiCollectEllipsoids)
+                collect_anyhit_ellipsoids(sbt_data, child, true);
+            else if (transmittance_anyhit_ellipsoids(sbt_data->data, child, mi_ray_flags, true))
+                return;
+        }
+        optixIgnoreIntersection();
+        return;
+    }
+
     if (is_ellipsoids) {
         const OptixEllipsoidsData &e = *((const OptixEllipsoidsData *) sbt_data->data);
         bool grouped = shape_type == (unsigned int) ShapeType::Ellipsoids && e.primitives_per_column > 1;
